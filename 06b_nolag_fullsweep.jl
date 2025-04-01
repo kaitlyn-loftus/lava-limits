@@ -10,9 +10,10 @@ using ProgressMeter
 using Random
 using LHS 
 using JLD2
+using OrdinaryDiffEq
 """
-this script runs a parallelized parameter sweep of the radiative balance cloud temperature model 
-for the full parameter space at a lower tolerance than script 4b for a convergence check 
+this script runs a parallelized parameter sweep of the ODE radiative balance cloud temperature model 
+for the full parameter space for SI text "The role of lag d in variability"
 """
 
 # set number of parameter combinations 
@@ -22,24 +23,25 @@ nsamp = Int(1e5)
 # exact values randomly selected via Latin hypercube 
 # (rng seeds set for reproducibility) 
 # here use full parameter bounds 
-log_min_Π1_search = log_min_Π1
-log_max_Π1_search = log_max_Π1
+log_min_Π1_search = log_min_Π1_prime
+log_max_Π1_search = log_max_Π1_prime
 
-log_min_Π2_search = log_min_Π2
-log_max_Π2_search = log_max_Π2
+log_min_Π2_search = log_min_Π2_prime
+log_max_Π2_search = log_max_Π2_prime
 
-log_min_Π3_search = log_min_Π3
-log_max_Π3_search = log_max_Π3
+log_min_Π3_search = log_min_Π3_prime
+log_max_Π3_search = log_max_Π3_prime
 
-log_min_β_search = -3
-log_max_β_search = 0.
+log_min_β_search = -3.
+log_max_β_search = log10(4)
 min_ΔTcloud_search = 0.
 max_ΔTcloud_search = 350.
 
 # directory to save outputs in 
-outdir="out/"
+outdir="out/SI/"
 # name of parameter sweep 
-sweepname = "fig3_fullsweep_radbal_logbeta_toltest"
+# sweepname = "nod_fullsweep_radbal_logbeta_1e5_Tsit5_fullbeta" # original name 
+sweepname = "nod_fullsweep_radbal" # rerun as this 
 # note output file saved as outdir*sweepname*".nc"
 # crash program if output file already exists (otherwise netcdf writing will crash at end)
 fname = outdir*sweepname*".nc"
@@ -52,18 +54,23 @@ end
 figdirbase = "sfigs/"
 
 # set numerical tolerances for integration 
-reltol = 1e-9 
-abstol = 1e-11
+reltol = 1e-8 
+abstol = 1e-10 
 
 # set how long to integrate  
-t̂end = 1e7
+t̂end = 5e8
+
+# adjust time checking periods 
+t̂check1=500.
+Δt̂=250.
+alg = Tsit5()
 
 # write notes for netcdf 
 notes4nc = "reltol = $(reltol), abstol = $(abstol), tend = $(t̂end) delay times"
 
 # number of cpus to parallelize over 
 # if running on a personal computer you may need to decrease ncpus
-ncpus = 6
+ncpus = 15
 
 # set up workers for distributed sweep 
 
@@ -97,6 +104,7 @@ try
         push!(LOAD_PATH,"./src/")
         using DDEModel
         using ProgressMeter
+        using OrdinaryDiffEq
     end
 
     # set up parameters 
@@ -108,7 +116,10 @@ try
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        t̂check1=$t̂check1
+        Δt̂=$Δt̂
+        alg=$alg
+        calcsolprop_pmap(i) = calcsolprop_ode($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end,t̂check1=t̂check1,Δt̂=Δt̂)
     end
 
     # run model over all parameter combinations with progress bar 
@@ -122,14 +133,10 @@ try
     rmprocs(worker_procs;waitfor=30)
 
     # perform checks
-    check_param_sweep(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
+    check_param_sweep_ode(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end,isplot=false)
 catch e 
     # shut down processes before throwing error 
     println("removing all worker processes!")
     rmprocs(worker_procs;waitfor=30)
     rethrow(e)
 end
-
-# compare results from default tolerances 
-compare_param_sweep("fig3_fullsweep_radbal_logbeta",outdir,sweepname,outdir)
-

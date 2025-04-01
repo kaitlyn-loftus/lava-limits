@@ -10,36 +10,38 @@ using ProgressMeter
 using Random
 using LHS 
 using JLD2
+
 """
 this script runs a parallelized parameter sweep of the radiative balance cloud temperature model 
-for the full parameter space
+with 10% of default numerical tolerance for a numerical convergence test 
+to construct Table S2
 """
 
 # set number of parameter combinations 
-nsamp = Int(1e4)
+nsamp = Int(1e5)
 
-# set parameter ranges for sweep 
+# set parameter ranges for sweep following Figure 3
 # exact values randomly selected via Latin hypercube 
 # (rng seeds set for reproducibility) 
-# here use full parameter bounds 
-log_min_Π1_search = log_min_Π1
+
+log_min_Π1_search = max(log_min_Π1,-2.75)
 log_max_Π1_search = log_max_Π1
 
-log_min_Π2_search = log_min_Π2
+log_min_Π2_search = max(log_min_Π2,-1.)
 log_max_Π2_search = log_max_Π2
 
 log_min_Π3_search = log_min_Π3
-log_max_Π3_search = log_max_Π3
+log_max_Π3_search = min(log_max_Π3,4.)
 
 log_min_β_search = -3
-log_max_β_search = 0.
+log_max_β_search = log10(4.)
 min_ΔTcloud_search = 0.
 max_ΔTcloud_search = 350.
 
 # directory to save outputs in 
-outdir="out/"
+outdir="out/SI/"
 # name of parameter sweep 
-sweepname = "fig3_fullsweep_radbal_logbeta"
+sweepname = "tabs2_zoomsweep_radbal_logbeta_10pcttol"
 # note output file saved as outdir*sweepname*".nc"
 # crash program if output file already exists (otherwise netcdf writing will crash at end)
 fname = outdir*sweepname*".nc"
@@ -49,21 +51,24 @@ if isfile(fname)
 end
 
 # set figdirbase 
-figdirbase = "ssfigs/"
+figdirbase = "sfigs/"
 
 # set numerical tolerances for integration 
-reltol = 1e-8 
-abstol = 1e-10 
+reltol = 1e-9 
+abstol = 1e-11
 
 # set how long to integrate  
-t̂end = 1e7
+t̂end = 3e3
+
+# increase maximum iterations from default because lower tolerances likely requires more iterations
+maxiters = 2e7
 
 # write notes for netcdf 
 notes4nc = "reltol = $(reltol), abstol = $(abstol), tend = $(t̂end) delay times"
 
 # number of cpus to parallelize over 
-# if running on a personal computer you may need to decrease ncpus
-ncpus = 6
+# if running on a personal computer you will need to decrease ncpus
+ncpus = 30
 
 # set up workers for distributed sweep 
 
@@ -108,7 +113,8 @@ try
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        maxiters=$maxiters
+        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end,maxiters=maxiters)
     end
 
     # run model over all parameter combinations with progress bar 
@@ -122,7 +128,7 @@ try
     rmprocs(worker_procs;waitfor=30)
 
     # perform checks
-    check_param_sweep2(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
+    check_param_sweep2(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end,isplot=false)
 catch e 
     # shut down processes before throwing error 
     println("removing all worker processes!")

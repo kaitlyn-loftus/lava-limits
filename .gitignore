@@ -1,0 +1,10 @@
+.
+..
+.DS_Store
+test*
+*.jld2
+*.nc
+*.pdf
+figs/*
+sfigs/*
+out/*

@@ -22,8 +22,8 @@ nsamp = Int(5e6)
 # set parameter ranges for sweep 
 # exact values randomly selected via Latin hypercube 
 # (rng seeds set for reproducibility) 
-# here use full parameter bounds 
-log_min_Π1_search = max(log_min_Π1,-2.)
+
+log_min_Π1_search = max(log_min_Π1,-2.75)
 log_max_Π1_search = log_max_Π1
 
 log_min_Π2_search = max(log_min_Π2,-1.)
@@ -33,7 +33,7 @@ log_min_Π3_search = log_min_Π3
 log_max_Π3_search = min(log_max_Π3,4.)
 
 log_min_β_search = -3
-log_max_β_search = 0.
+log_max_β_search = log10(4.)
 min_ΔTcloud_search = 0.
 max_ΔTcloud_search = 350.
 
@@ -50,21 +50,21 @@ if isfile(fname)
 end
 
 # set figdirbase 
-figdirbase = "sfigs/"
+figdirbase = "ssfigs/"
 
 # set numerical tolerances for integration 
 reltol = 1e-8 
 abstol = 1e-10 
 
 # set how long to integrate  
-t̂end = 1e4
+t̂end = 3e3
 
 # write notes for netcdf 
 notes4nc = "reltol = $(reltol), abstol = $(abstol), tend = $(t̂end) delay times"
 
 # number of cpus to parallelize over 
 # if running on a personal computer you will need to decrease ncpus
-ncpus = 60
+ncpus = 50
 
 # set up workers for distributed sweep 
 
@@ -109,7 +109,7 @@ try
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
     end
 
     # run model over all parameter combinations with progress bar 
@@ -123,7 +123,7 @@ try
     rmprocs(worker_procs;waitfor=30)
 
     # perform checks
-    check_param_sweep(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
+    check_param_sweep2(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
 catch e 
     # shut down processes before throwing error 
     println("removing all worker processes!")

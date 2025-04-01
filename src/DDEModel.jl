@@ -20,11 +20,17 @@ main model functions
 export calcsolprop_radbal,checksol_radbal,outputrun_radbal
 export calcsolprop_const,checksol_const,outputrun_const
 export writenc_sweep,setupparams4sweep,setupparams4sweep_Πonly,setupparams4sweep_βlog
+export setupparams4sweep_βlog_refα
 export p_ref_SiO_0vap,T_ref_SiO_0vap
 export log_min_Π1,log_max_Π1,log_min_Π2,log_max_Π2,log_min_Π3,log_max_Π3
 export check_param_sweep,compare_param_sweep
 export make_Π_Tcloudβ_3σ_figs_scatter,make_Π_Tcloudβ_3σ_figs_2model_poly
 export make_Π_Tcloudβ_3σ_figs_radbal_nolw_poly
+export make_Π_Tcloudβ_pTrefα_3σ_figs_radbal_nolw_poly
+export calcsolprop_radbal2,check_param_sweep2,outputrun_radbal2,checkendsol_radbal2
+export calcsolprop_ode,checksol_ode,check_param_sweep_ode
+export log_min_Π1_prime,log_max_Π1_prime,log_min_Π2_prime,log_max_Π2_prime,log_min_Π3_prime,log_max_Π3_prime
+
 
 
 # CONSTANTS  ######################################################
@@ -60,6 +66,14 @@ const log_min_Π2 = -7.3406727607345 # [ ]
 const log_max_Π2 = 3.71024848746481 # [ ]
 const log_min_Π3 = 0.439369249066335 # log([kg s⁻³ K⁻¹])
 const log_max_Π3 = 6.26376753354504 # log([kg s⁻³ K⁻¹])
+
+# bulk no lag parameter bounds 
+const log_min_Π1_prime = -6.7560576780207615 # log([Pa⁻¹ s⁻¹])
+const log_max_Π1_prime = -1.1495885677877444 # log([Pa⁻¹ s⁻¹])
+const log_min_Π2_prime = -10.896975261501785 # [s⁻¹]
+const log_max_Π2_prime = -2.2262652550140793 # [s⁻¹]
+const log_min_Π3_prime = 6.375882991545229 # log([kg s⁻² K⁻¹])
+const log_max_Π3_prime = 9.820070034312327 # log([kg s⁻² K⁻¹])
 
 # CONSTANTS  ######################################################
 
@@ -138,6 +152,88 @@ function solvedTτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma
     # check whether enough latent heat of melting has been supplied to resume surface temperature increasing 
     # (when surface temperature at magma ocean solidus temperature)
     cb_increaseTsurf = ContinuousCallback(checkL_increaseTsurf,nothing,affectL_increaseTsurf_radbal!)
+    # group callbacks together 
+    cbset = CallbackSet(cb_stop,cb_increaseTsurf,cb_magma_solidus)
+
+    # integrate! 
+    # return solution 
+    # see DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/basics/solution/
+    solve(prob,alg;maxiters=maxiters,callback=cbset,abstol=abstol,reltol=reltol,tstops=t̂checks,dtmax=Δt̂/4) 
+end
+
+function solvedTlogτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀,τ₀,Tsurfeq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+    """
+    integrate coupled equations for dT/dt̂, dτ/dt̂, & dL/dt̂ following the radiative balance model 
+    inputs:
+        * Π₁ [Pa⁻¹] - parameter 1
+        * Π₂ [ ] - parameter 2
+        * Π₃ [kg s⁻³ K⁻¹] - parameter 3
+        * p_ref [Pa] - reference pressure for Clausius-Clapeyron
+        * T_ref [K] - reference temperature for Clausius-Clapeyron
+        * α [ ] - albedo parameter 
+        * S₀ [W m⁻²] - incident stellar insolation 
+        * f [ ] - heat redistribution factor 
+        * β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+        * Tmagma_solidus [K] - solidus temperature of magma 
+        * ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+        * t̂end [ ] - maximum (model) time to integrate for 
+        * T₀ [K] - initial surface temperature 
+        * τ₀ [ ] - initial shortwave optical depth 
+        * Tsurfeq [K] - surface temperature fixed point 
+        * maxiters [int] - maximum iterations of the DDE solver 
+            + optional, default value: 1e7 
+        * alg [OrdinaryDiffEq integration algorithm]
+            note, see https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/ for options
+            + optional, default value: KenCarp4()
+        * * reltol [Float] - relative tolerance of the DDE solver 
+            + optional, default value: 1e-8
+        * abstol [Float] - absolute tolerance of the DDE solver 
+            + optional, default value: 1e-10
+    output:
+        * DDE solution [SciMLBase.ODESolution] - solution object 
+    """ 
+    # set up times to check for early stopping 
+    t̂checks = t̂check1:Δt̂:t̂end
+
+    # don't allow initial Tsurf condition below or at solidus
+    T₀ = max(T₀,Tmagma_solidus+1.)
+    # therefore, start with L integration off 
+    doLint = 0
+
+    # set initial condition 
+    TlogτL₀ = [T₀,log(τ₀),0.]
+
+    # non-allocating history function 
+    # see discussion of history functions in DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/types/dde_types/#dde_prob
+    # https://docs.sciml.ai/DiffEqDocs/stable/tutorials/dde_example/
+    calch₀(p,t;idxs=nothing) = typeof(idxs) <: Number ? TlogτL₀[idxs] : TlogτL₀
+
+    # set up DDE problem 
+    # see DifferentialEquations.jl documentation: 
+    # https://docs.sciml.ai/DiffEqDocs/stable/types/dde_types/
+    prob = DDEProblem(calcdTlogτLdt̂_radbal!, TlogτL₀, calch₀, (0.,t̂end), [Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint];
+    constant_lags=[1.],isoutofdomain=isoutofdomain2)
+
+    # convert ODE integration algorithm to DDE equivalent 
+    # see Widmann & Rackauckas (2022) [doi:10.48550/arXiv.2208.12879]
+    # and DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/solvers/dde_solve/
+    alg = MethodOfSteps(alg;constrained=true)
+
+    # set up callbacks 
+    # see DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/features/callback_functions/
+
+    # check whether solution has stabilized to fix point or limit cycle 
+    checkisstop = (u,t,integrator) -> checkisstoplong(u,t,integrator,t̂checks,Tsurfeq,Δt̂,ΔTthres)
+    cb_stop = DiscreteCallback(checkisstop,terminate!) #save_positions=(true, false))
+    # check whether surface temperature hits magma ocean solidus temperature 
+    cb_magma_solidus = ContinuousCallback(checkTmagma_solidus,nothing,affectTmagma_solidus_radbal2!;abstol=abstol)
+    # check whether enough latent heat of melting has been supplied to resume surface temperature increasing 
+    # (when surface temperature at magma ocean solidus temperature)
+    cb_increaseTsurf = ContinuousCallback(checkL_increaseTsurf,nothing,affectL_increaseTsurf_radbal2!;abstol=abstol)
     # group callbacks together 
     cbset = CallbackSet(cb_stop,cb_increaseTsurf,cb_magma_solidus)
 
@@ -295,6 +391,61 @@ function calcdTτLdt̂_radbal!(dTτLdt̂,TτL,h,p,t̂)
     nothing
 end
 
+function calcdTlogτLdt̂_radbal!(dTlogτLdt̂,TlogτL,h,p,t̂)
+    """
+    calculate dTτLdt̂ in place for radiative balance model  
+    inputs:
+        * dTτLdt̂ [Array] - array with dTsurfdt̂, dτSWdt̂, dLdt̂ to be modified in place
+            + dTτLdt̂[1] = dTsurf/dt̂ [K / delay time]
+            + dTτLdt̂[2] = dτSW/dt̂ [1 / delay time]
+            + dTτLdt̂[3] = dL/dt̂ [J m⁻² / delay time]
+        * TτL [Array] - array with Tsurf(t̂), τSW(t̂), L(t̂)
+            + TτL[1] - Tsurf [K]
+            + TτL[2] - τSW [ ]
+            + TτL[3] - L [J m⁻²]
+        * h [function] - history function, see DifferentialEquations documentation
+        * t̂ [delay time] - time 
+        * p [Array] - array of parameters of DDE 
+            + Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint
+    output:
+        nothing 
+    """
+    
+    Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint = view(p,:) # unpack parameters
+    Tsurf, logτSW, L = TlogτL # unpack T(t̂), τ(t̂), L(t̂)
+    logτSW = max(logτSW,-100.)
+    τSW = exp(logτSW)
+
+    # reset when integrator tries crazy test values for Tsurf and τSW 
+    Tsurf = max(Tsurf,ΔTcloud+1.)
+    # τSW = max(τSW,0.)
+ 
+    εcloud = calcεcloud(τSW,β) # [ ] LW cloud emissivity 
+    T_surf_delay = h(p,t̂-1;idxs=1) # [K] delay Tsurf
+
+    # dTlogτLdt̂[2] = (Π₁*p_ref*exp(-T_ref/T_surf_delay) - Π₂*τSW)/τSW # dτSW/dt̂ [ ]
+    dTlogτLdt̂[2] = Π₁*p_ref*exp(-T_ref/T_surf_delay)/τSW - Π₂ # dlogτSW/dt̂ [ ]
+
+    # solve for Tcloud_down 
+    Tcloud_down = calcTclouddown(ΔTcloud,Tsurf) # [K]
+
+    # note doLint set externally via callback 
+    # determines whether to integrate L or Tsurf 
+    # not a Boolean for performance purposes 
+    if doLint==1.
+        # when Tsurf==Tsolidus 
+        # if cooling, put cooling toward latent heat 
+        # if heating, put toward latent heat until L = 0
+        dTlogτLdt̂[1] = 0. # dTsurf/dt̂ [K s⁻¹]
+        dTlogτLdt̂[3] = -(f*S₀/(1. +α*τSW) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4) # dL/dt̂ [J m⁻² s⁻¹]
+    else
+        dTlogτLdt̂[1] = (f*S₀/(1. +α*τSW) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4)/Π₃ # dTsurf/dt̂ [K s⁻¹]
+        dTlogτLdt̂[3] = 0. # dL/dt̂ [J m⁻² s⁻¹]
+    end
+  
+    nothing
+end
+
 function calcdTτLdt̂_const!(dTτLdt̂,TτL,h,p,t̂)
     """
     calculate dTτLdt̂ in place for constant model  
@@ -430,8 +581,10 @@ function findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud;Teq_m
     # make version of zero function which only requires T
     # as an input to put into root finder
     findTeq0 = (T) -> findTeqLWradbal0long(T,Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud) 
+    
     # root find fixed point T
     Teq = try 
+        # find_zeros(findTeq0,(Teq_min,Teq_max))[1]
         find_zero(findTeq0,(Teq_min,Teq_max))
     catch e
         println("root finding error in findTτeqnum_radbal!")
@@ -442,6 +595,46 @@ function findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud;Teq_m
     τeq = Π₁*p_ref*exp(-T_ref/Teq)/Π₂
     # return values
     Teq,τeq
+end
+
+function findTτeqnum_radbal2(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud;Teq_min=1000.,Teq_max=3500.)
+    """
+    find surface temperature and shortwave cloud optical depth for radiative balance model
+    set dTdt̂ = 0, dτdt̂ = 0 and solve for associated Tsurf,τSW numerically
+
+    inputs:
+        * Π₁ [Pa⁻¹] - bulk parameter 1
+        * Π₂ [ ] - bulk parameter 2
+        * T_ref [K] - reference temperature for Clausius-Clapeyron
+        * p_ref [Pa] - reference pressure for Clausius-Clapeyron
+        * α [ ] - albedo parameter 
+        * S₀ [W m⁻²] - incident stellar insolation 
+        * f [ ] - heat redistribution factor 
+        * β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+        * ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+        * Teq_min [K] - minimum guess for Teq 
+        * Teq_max [K] - maximum guess for Teq, this should be set from S₀
+    outputs:
+        * Teq [K] - fixed point surface T
+        * τeq [ ] - fixed point shortwave τ
+    """
+    # make version of zero function which only requires T
+    # as an input to put into root finder
+    findTeq0 = (T) -> findTeqLWradbal0long(T,Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud) 
+    # root find fixed point T
+    nzeros = length(find_zeros(findTeq0,(Teq_min,Teq_max)))
+    Teq = try 
+        # find_zeros(findTeq0,(Teq_min,Teq_max))[1]
+        find_zero(findTeq0,(Teq_min,Teq_max))
+    catch e
+        println("root finding error in findTτeqnum_radbal!")
+        @show Π₁ Π₂ T_ref p_ref α S₀ f β ΔTcloud
+        rethrow(e)
+    end
+    # calculate fixed point τ from T
+    τeq = Π₁*p_ref*exp(-T_ref/Teq)/Π₂
+    # return values
+    Teq,τeq,nzeros
 end
 
 function findTeqLWconst0long(T,Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,Tcloud)
@@ -510,7 +703,7 @@ function findperiod0long(t̂,sol,Teq)
     sol(t̂;idxs=1) - Teq
 end
 
-function checkisstoplong(u,t,integrator,tchecks,Teq,Δt,ΔTthres;no_pts=20)::Bool
+function checkisstoplong(u,t,integrator,tchecks,Teq,Δt,ΔTthres;no_pts=20,ετ=1e-4)::Bool
     """
     check whether to stop integration (long version)
     """
@@ -536,17 +729,49 @@ function checkisstoplong(u,t,integrator,tchecks,Teq,Δt,ΔTthres;no_pts=20)::Boo
                     t̂end = endt̂s[filt_neg_endΔT][end]
                     t̂whereTeq = find_zeros(findperiod0,t̂start,t̂end;no_pts=no_pts)
                     nt̂whereTeq = length(t̂whereTeq)
-                    if nt̂whereTeq>5
-                        t̂Pstart = t̂whereTeq[3:2:end]
-                        t̂Pend = t̂whereTeq[1:2:(end - 2 + nt̂whereTeq%2)]
-                        Ps = t̂Pstart .- t̂Pend
-                        P = mean(Ps)   
-                        if std(Ps)/P > 1e-2 # period erratic 
-                            isstop = false
-                        else # regular period 
-                            isstop = true 
+                    if nt̂whereTeq>5 
+                        n = 1
+                        nskip = 2*n
+                        # calculate τ at Teq crossings 
+                        τTeqs = exp.(sol.(t̂whereTeq;idxs=2))
+                        # calculate mid point T eqs 
+                        t̂whereTeqmid = t̂whereTeq[1:(end-1)] .+ 0.5 .* (t̂whereTeq[2:end] .- t̂whereTeq[1:(end-1)])
+                        Teqsmid = sol.(t̂whereTeqmid;idxs=1)
+                        while (nt̂whereTeq>(2*nskip+1)) && (n <= 4) && (isstop == false)
+                            t̂Pstart = t̂whereTeq[(nskip+1):nskip:end]
+                            t̂Pend = t̂whereTeq[1:nskip:(end - nskip)]
+
+                            Ps = t̂Pstart .- t̂Pend
+                            P = mean(Ps) 
+                            if (std(Ps)/P > 1e-2)
+                                isstop = false
+                            else 
+                                isvar = trues(nskip)
+                                for i ∈ 1:nskip
+                                    τTeqs_skip = τTeqs[i:nskip:end]
+                                    τTeq_skip = max(mean(τTeqs_skip),ετ)
+                                    isvar[i] = std(τTeqs_skip)/τTeq_skip > 1e-2
+                                end
+
+                                if any(isvar)
+                                    isstop = false
+                                else
+                                    for i ∈ 1:nskip
+                                        Teqsmid_skip = Teqsmid[i:nskip:end]
+                                        Teqmid_skip = mean(Teqsmid_skip)
+                                        isvar[i] = std(Teqsmid_skip)/Teqmid_skip > 1e-3 
+                                    end
+                                    if any(isvar)
+                                        isstop = false
+                                    else
+                                        isstop = true
+                                    end
+                                end
+                            end
+                            n += 1
+                            nskip = 2*n
                         end
-                    else # very slowly oscilating 
+                    else # not enough Teq crossings to test for period
                         isstop = false
                     end
                 else # T only bounding Teq given relative error 
@@ -594,6 +819,42 @@ function affectL_increaseTsurf_radbal!(integrator)
         # ignore if L integration turned off and L smaller than absolute tolerance
         if dointL==0 && L < integrator.opts.abstol 
             integrator.u[3] = 0.
+        else # otherwise alert user 
+            @info "L crossed to 0 but F <= 0"
+            @show Tsurf L F dointL
+        end
+    end
+    nothing 
+end
+
+function affectL_increaseTsurf_radbal2!(integrator)
+    """
+    apply this function when L transitions from L>0 to L = 0
+    turn off L integration, set L = 0 (exactly)
+    version for radiative balance model 
+    """
+    Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,dointL = view(integrator.p,:)
+    Tsurf,logτ,L = integrator.u
+    τ = exp(logτ)
+    εcloud = calcεcloud(τ,β)
+    Tcloud_down = calcTclouddown(ΔTcloud,Tsurf)
+    F = f*S₀/(1+α*τ) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4
+    if F > 0.
+        # integrator.u[1] = Tmagma_solidus
+        # integrator.u[3] = 0.
+        integrator.p[end] = 0. # turn off L integration 
+        # # adjust time step to be small given switch in integration 
+        # Δt = get_proposed_dt(integrator)
+        # set_proposed_dt!(integrator,max(Δt*1e-1,integrator.opts.dtmin*1e4))
+        # # # adjust τ in case of interpolator error 
+        # # if τ<0
+        # #     integrator.u[2] = 0.
+        # # end
+    else
+        # ignore if L integration turned off and L smaller than absolute tolerance
+        if dointL==0 && L < integrator.opts.abstol 
+            integrator.u[3] = 0.
+            @info "affectL_increaseTsurf_radbal triggered"
         else # otherwise alert user 
             @info "L crossed to 0 but F <= 0"
             @show Tsurf L F dointL
@@ -666,6 +927,35 @@ function affectTmagma_solidus_radbal!(integrator)
     nothing 
 end
 
+function affectTmagma_solidus_radbal2!(integrator)
+    """
+    apply this function when Tsurf decreases to hit Tsolidus 
+    turn on L integration instead of Tsurf integration,
+    set Tsurf = Tsolidus (exactly)
+    exclude edge case where Tsurf derivative switches to increasing again when hitting Tsolidus
+    version for radiative balance model
+    """
+    # turn on L integration unless dTsurf/dt switches sign exactly at Tsurf = Tmagma_solidus 
+    Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,dointL = view(integrator.p,:)
+    Tsurf,logτ,L = integrator.u
+    τ = exp(logτ)
+    εcloud = calcεcloud(τ,β)
+    Tcloud_down = calcTclouddown(ΔTcloud,Tsurf)
+    F = f*S₀/(1+α*τ) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4
+    # @show F, Tsurf, L, dointL, integrator.t
+    if F < 0. # exclude case where F ≥ 0 exactly at Tsurf = Tmagma_solidus 
+        integrator.p[end] = 1. # turn on L integration 
+        # adjust time step to be small to prevent overshooting 
+        # rapid magma ocean transition from freezing to melting 
+        # and getting L < 0 
+        Δt = get_proposed_dt(integrator)
+        if Δt > 1e-3 
+            set_proposed_dt!(integrator,Δt*1e-1)
+        end
+    end
+    nothing 
+end
+
 function affectTmagma_solidus_const!(integrator)
     """
     apply this function when Tsurf decreases to hit Tsolidus 
@@ -702,6 +992,16 @@ function isoutofdomain(u,p,t)
     (Tsurf < (Tmagma_solidus - 1)) || (τ<0.) #|| (L < -1e-2)
 end
 
+function isoutofdomain2(u,p,t)
+    """
+    return true when solution out of domain 
+    (slighly relaxed due to callbacks)
+    """
+    Tsurf,logτ,L = u 
+    Tmagma_solidus = p[10]
+    (Tsurf < (Tmagma_solidus - 1)) || (L < -1e-5)
+end
+
 # FUNCTIONS DEALING WITH CALLBACKS  ################################
 
 ####################################################################
@@ -718,6 +1018,7 @@ function calcA(τSW,α)
     """
     1. - 1/(1. + α*τSW)  # [ ]
 end
+
 
 function calcεcloud(τSW,β)
     """
@@ -856,6 +1157,169 @@ function checkendsol_radbal(sol,ΔTthres,Tsurfeq,Δt̂,β,ΔTcloud,α,Rstar,apla
                         hlines!(ax,Tsurfeq,linestyle=:dash,color=:red)
                         hspan!(ax,Tsurfeq-ΔTthres,Tsurfeq+ΔTthres,color=(:red,0.3))
                         save(figdir*"checkperiod"*runname*".pdf",fig)
+                    end
+                end
+            end
+        end
+    end
+    # possible plotting option
+    if (endstateflag == 0) && isplot
+        endt̂s = sol.t[filt]
+        fig = Figure()        
+        ax = Axis(fig[1,1],xlabel="time [delay times]",ylabel="surface temperature [K]")
+        ax.title = "endstateflag = 0, retcode = $(sol.retcode)"
+        scatter!(ax,endt̂s,endTsurfs,color=:black)
+        hlines!(ax,Tsurfeq,linestyle=:dash,color=:red)
+        hspan!(ax,Tsurfeq-ΔTthres,Tsurfeq+ΔTthres,color=(:red,0.3))
+        save(figdir*"checkperiod"*runname*".pdf",fig)
+    end
+
+    endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax
+end
+
+function checkendsol_radbal2(sol,ΔTthres,Tsurfeq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA;λLW=4.5e-6,λSW=0.5e-6,isplot=false,figdir="",runname="",no_pts=20,ετ=1e-4)
+    """
+    check the end state of integration for radiative balance version of model 
+    """
+    # set default values 
+    endstateflag = 0 
+    P = NaN
+
+    # filter for times in the last Δt̂ 
+    # (excluding last step since this is how end criterion is determined)
+    # (last two steps are usually same time due to callbacks... 
+    # turning off callback saving seems to cause issues so just index here)
+    filt = sol.t .>= (sol.t[end]-Δt̂) 
+    if sol.t[end] == sol.t[end-1]
+        filt[(end-1):end] .= false
+    else
+        filt[end] = false
+    end
+
+
+    # get prognostic variables in the last Δt̂
+    endTsurfs = sol[1,filt]
+    endlogτSWs = sol[2,filt]
+    endτSWs = exp.(endlogτSWs)
+    endLs = sol[3,filt]
+
+    # calculate LW brightness temperature 
+    endTcloud_ups = calcTcloudup.(ΔTcloud,endTsurfs)
+    endTbLWs = calcTbrightλ_LW(λLW,endTsurfs,endτSWs,endTcloud_ups,β)
+    # calculate SW brightness temperature 
+    endTbSWs = calcTbrightλ_SW.(λSW,endTsurfs,endτSWs,α,Rstar,aplanet,Tstar,ratA)
+
+    
+    # calculate minimum and maximum values for output 
+    TbLWmin = minimum(endTbLWs)
+    TbLWmax = maximum(endTbLWs)
+
+    TbSWmin = minimum(endTbSWs)
+    TbSWmax = maximum(endTbSWs)
+
+    Tsurfmin = minimum(endTsurfs)
+    Tsurfmax = maximum(endTsurfs)
+
+    τSWmin = minimum(endτSWs)
+    τSWmax = maximum(endτSWs)
+
+    Lmin = minimum(endLs)
+    Lmax = maximum(endLs)
+
+    # conditions used in isstoplong with additional endstateflag and plotting details 
+    if (Tsurfmin <= (Tsurfeq + ΔTthres)) && (Tsurfmax>=(Tsurfeq - ΔTthres)) # check if T solution bounding Teq 
+        if (Tsurfmin >= (Tsurfeq - ΔTthres)) && (Tsurfmax <= (Tsurfeq + ΔTthres)) # check if within threshold
+            endstateflag = 1
+        else # check what oscillations (if any) present 
+            findperiod0 = (t̂) -> findperiod0long(t̂,sol,Tsurfeq)
+            endt̂s = sol.t[filt]
+            endΔTs = endTsurfs .- Tsurfeq
+            filt_pos_endΔT = endΔTs .> 0
+            filt_neg_endΔT = endΔTs .< 0
+            if (sum(filt_pos_endΔT) > 0) && (sum(filt_neg_endΔT) > 0)
+                t̂start = endt̂s[filt_pos_endΔT][1]
+                t̂end = endt̂s[filt_neg_endΔT][end]
+                # note no_pts handles number of initial samples of interval for 0s
+                t̂whereTeq = find_zeros(findperiod0,t̂start,t̂end;no_pts=no_pts) # Int(round(Δt̂))
+                nt̂whereTeq = length(t̂whereTeq)
+                if nt̂whereTeq>5
+                    n = 1
+                    nskip = 2*n
+                    # calculate τ at Teq crossings 
+                    τTeqs = exp.(sol.(t̂whereTeq;idxs=2))
+                    # calculate mid point T eqs 
+                    t̂whereTeqmid = t̂whereTeq[1:(end-1)] .+ 0.5 .* (t̂whereTeq[2:end] .- t̂whereTeq[1:(end-1)])
+                    Teqsmid = sol.(t̂whereTeqmid;idxs=1)
+                    isstop = false
+                    while (nt̂whereTeq>(2*nskip+1)) && (n <= 4) && (isstop == false)
+                        t̂Pstart = t̂whereTeq[(nskip+1):nskip:end]
+                        t̂Pend = t̂whereTeq[1:nskip:(end - nskip)]
+
+                        Ps = t̂Pstart .- t̂Pend
+                        P = mean(Ps)   
+                        if (std(Ps)/P > 1e-2) 
+                            isstop = false
+                            endstateflag = 3
+                            P = NaN 
+                        else 
+                            isvar = trues(nskip)
+                            for i ∈ 1:nskip
+                                τTeqs_skip = τTeqs[i:nskip:end]
+                                τTeq_skip = max(mean(τTeqs_skip),ετ)
+                                isvar[i] = std(τTeqs_skip)/τTeq_skip > 1e-2
+                            end
+
+                            if any(isvar)
+                                isstop = false
+                                endstateflag = 3
+                                P = NaN 
+                            else
+                                for i ∈ 1:nskip
+                                    Teqsmid_skip = Teqsmid[i:nskip:end]
+                                    Teqmid_skip = mean(Teqsmid_skip)
+                                    isvar[i] = std(Teqsmid_skip)/Teqmid_skip > 1e-3
+                                end
+                                if any(isvar)
+                                    isstop = false
+                                    endstateflag = 3
+                                    P = NaN 
+                                else
+                                    isstop = true
+                                    if n==1
+                                        endstateflag = 2
+                                    else
+                                        endstateflag = 8
+                                    end
+                                end
+                            end
+                        end
+                        n += 1
+                        nskip = 2*n
+                    end
+                    # plotting option 
+                    if isplot
+                        fig = Figure()
+                        ax = Axis(fig[1,1],xlabel="time [delay times]",ylabel="surface temperature [K]")
+                        if (endstateflag == 2) || (endstateflag == 8)
+                            ax.title = "period = $(round(P,sigdigits=3))"
+                        else endstateflag == 3
+                            ax.title = "erratic period"
+                        end
+
+                        t̂whereTeqmid = t̂whereTeq[1:(end-1)] .+ 0.5 .* (t̂whereTeq[2:end] .- t̂whereTeq[1:(end-1)])
+                        Teqsmid = sol.(t̂whereTeqmid;idxs=1)
+
+                        lines!(ax,endt̂s,endTsurfs,color=:black)
+                        vlines!(ax,t̂whereTeq,linestyle=:dash,color=:red)
+                        hlines!(ax,Tsurfeq,linestyle=:dash,color=:red)
+                        hspan!(ax,Tsurfeq-ΔTthres,Tsurfeq+ΔTthres,color=(:red,0.3))
+                        save(figdir*"checkperiod"*runname*".pdf",fig)
+                        if !(isnan(P))
+                            xlims!(ax,t̂whereTeq[1],t̂whereTeq[1]+P)
+                            save(figdir*"checkperiod"*runname*"_zoom1P.pdf",fig)
+
+                        end
+
                     end
                 end
             end
@@ -1221,6 +1685,144 @@ function calcsolprop_radbal(p;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
     endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax
 end
 
+function calcsolprop_radbal2(p;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
+    abstol=1e-10,fTsurf₀=0.99,fτSW₀=0.99,addTsurf₀=0.,addτSW₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e4,ΔTthres=1.,
+    Rstar=R55cncA,aplanet=a55cnce,Tstar=T55cncA,ratA=1.,isplot=false,figdir="",runname="")
+    """
+    calculate model solution properties for radiative balance model 
+    inputs:
+        * p [Array, dim:11] - array of parameters for model 
+            + Π₁ [Pa⁻¹] - bulk parameter 1 
+            + Π₂ [ ] - bulk parameter 2 
+            + Π₃ [kg s⁻³ K⁻¹] - bulk parameter 3 
+            + T_ref [T] - reference temperature for Clausius-Clapeyron 
+            + p_ref [Pa] - reference pressure for Clausius-Clapeyron
+            + α [ ] - albedo parameter 
+            + S₀ [W m⁻²] - incident stellar insolation 
+            + f [ ] - heat redistribution factor 
+            + β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+            + ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+            + Tmagma_solidus [K] - solidus temperature of magma
+        * maxiters [Int] - maximum iterations of the DDE solver 
+            + optional, default value: 1e7 
+        * alg [OrdinaryDiffEq integration algorithm]
+            note, see https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/ for options
+            + optional, default value: KenCarp4()
+        * reltol [Float] - relative tolerance of the DDE solver 
+            + optional, default value: 1e-8
+        * abstol [Float] - absolute tolerance of the DDE solver 
+            + optional, default value: 1e-10
+        > note, Tsurf(t̂=0) = fTsurf₀ * Tsurfeq + addTsurf₀
+            * fTsurf₀ [ ] - multiplicative factor for Tsurf for initial condition 
+                + optional, default value: 0.99
+            * addTsurf₀ [K] - additive factor for Tsurf for initial condition 
+                + optional, default value: 0 K
+        > note, τSW(t̂=0) = fτSW₀ * τSWeq + addτSW₀
+            * fτSW₀ [ ] - multiplicative factor for shortwave optical depth for initial condition
+                + optional, default value: 0.99
+            * addτSW₀ [ ] - additive factor for shortwave optical depth for initial condition
+                + optional, default value: 0
+        * t̂check1 [delay time] - first time to check DDE ending conditions 
+            + optional, default value: 300 delay times
+        * Δt̂ [delay time] - time duration to use to check ending conditions, note Δt̂ ≤ t̂check1
+            + optional, default value: 100 delay times 
+        * t̂end [delay time] - end time for integration if DDE solution does not stabilize
+            note, important in chaos regimes of parameter space !
+            + optional, default value: 1e4 delay time 
+        * ΔTthres [K] - surface temperature buffer around fixed point for determining end state 
+            note, lower values will cause longer integration
+            do not set below about 10*reltol*Teq 
+            + optional, default value: 1 K 
+        * Rstar [m] - radius of star, used for SW brightness temperature diagnostic 
+            + optional, default value: R55cncA (radius of 55 Cnc A)
+        * aplanet [m] - planet semi-major axis, used for SW brightness temperature diagnostic
+            + optional, default value: a55cnce (semi-major axis of 55 Cnc e)
+        * Tstar [K] - effective temperature of star, used for SW brightness temperature diagnostic
+            + optional, default value: T55cncA (effective temperature of 55 Cnc A)
+        * ratA [ ] - ratio of geometric albedo to substellar point albedo 
+            + optional, default value: 1
+        * isplot [Bool] - whether to make plots associated with diagnosing solution end state
+            note, do not set to true for a large parameter sweep  
+            + optional, default value: false 
+        * figdir [String] - figure directory if isplot=true 
+            + optional, default value: ""
+        * runname [String] - name of run for saving figure if isplot=true 
+            + optional, default value: ""
+
+    outputs:
+        * endstateflag [Int] - integer flag associated with integration end state 
+        * P [delay time] - period of limit cycle if applicable (otherwise NaN)
+        * Tsurfmin [K] - minimum surface temperature in last Δt̂ of integration time 
+        * Tsurfmax [K] - maximum surface temperature in last Δt̂ of integration time 
+        * TbLWmin [K] - minimum LW brightness temperature (λ = 4.5 μm) in last Δt̂ of integration time 
+        * TbLWmax [K] - maximum LW brightness temperature (λ = 4.5 μm) in last Δt̂ of integration time 
+        * TbSWmin [K] - minimum SW brightness temperature (λ = 500 nm) in last Δt̂ of integration time
+        * TbSWmax [K] - maximum LW brightness temperature (λ = 500 nm) in last Δt̂ of integration time
+        * τSWmin [ ] - minimum SW cloud optical depth in last Δt̂ of integration time 
+        * τSWmax [ ] - maximum SW cloud optical depth in last Δt̂ of integration time
+        * Lmin [J m⁻²] - minimum magma ocean column accumulated latent heat of fusion in last Δt̂ of integration time
+        * Lmax [J m⁻²] - maximum magma ocean column accumulated latent heat of fusion in last Δt̂ of integration time
+    """
+    # throw error if Δt̂ > t̂check1
+    if Δt̂ > t̂check1
+        @show Δt̂ t̂check1
+        error("Δt̂ > t̂check1 not permitted! set Δt̂ ≤ t̂check1!")
+    end
+
+    # expand parameters 
+    Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus = p
+
+    Tsurfeq,τSWeq = findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud)
+
+    # don't integeate if Tsurfeq<Tmagma_solidus
+    if Tsurfeq<Tmagma_solidus
+        return -2,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+    end
+    
+    Tsurf₀ = Tsurfeq*fTsurf₀ + addTsurf₀
+    τSW₀ = max(τSWeq*fτSW₀ + addτSW₀,abstol)
+
+    sol = solvedTlogτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,Tsurf₀,τSW₀,Tsurfeq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+
+    endstateflag = -1 
+    P = NaN 
+    Tsurfmin = NaN
+    Tsurfmax = NaN
+    TbLWmin = NaN
+    TbLWmax = NaN
+    TbSWmin = NaN
+    TbSWmax = NaN
+    τSWmin = NaN
+    τSWmax = NaN
+    Lmin = NaN
+    Lmax = NaN
+
+    # alert user if return code not successful 
+    if SciMLBase.successful_retcode(sol)
+        endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax = checkendsol_radbal2(sol,ΔTthres,Tsurfeq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA;isplot=isplot,figdir=figdir,runname=runname)
+    else
+        @info "unsuccessful integration!"
+        @show p sol.retcode
+    end
+
+    # adjust endstateflag if hit t̂end 
+    if sol.t[end] == t̂end
+        if endstateflag == 0
+            endstateflag = 4
+        elseif endstateflag == 1
+            endstateflag = 5
+        elseif endstateflag == 2
+            endstateflag = 6
+        elseif endstateflag == 3
+            endstateflag = 7
+        elseif endstateflag == 8
+            endstateflag = 9
+        end
+    end
+
+    endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax
+end
+
 
 function calcsolprop_const(p;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
     abstol=1e-10,fTsurf₀=0.99,fτSW₀=0.99,addTsurf₀=0.,addτSW₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e4,ΔTthres=1.,
@@ -1457,6 +2059,103 @@ function outputrun_radbal(p,outdir,runname;maxiters=1e7,alg=KenCarp4(),reltol=1e
     nothing 
 end
 
+function outputrun_radbal2(p,outdir,runname;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
+    abstol=1e-10,fT₀=0.99,fτ₀=0.99,addT₀=0.,addτ₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e7,ΔTthres=1.,
+    isverbose=true,fsteps=10,Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.)
+    """
+    run radiative balance model for two initial conditions and save many outputs to netcdf 
+    note, can generate large output files size for limit cycles! 
+    do not use for a large number of parameters at once
+    
+    inputs:
+        * p [Array, dim:11] - array of parameters for model
+            + Π₁ [Pa⁻¹] - bulk parameter 1 
+            + Π₂ [ ] - bulk parameter 2 
+            + Π₃ [kg s⁻³ K⁻¹] - bulk parameter 3 
+            + T_ref [T] - reference temperature for Clausius-Clapeyron 
+            + p_ref [Pa] - reference pressure for Clausius-Clapeyron
+            + α [ ] - albedo parameter 
+            + S₀ [W m⁻²] - incident stellar insolation 
+            + f [ ] - heat redistribution factor 
+            + β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+            + ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+            + Tmagma_solidus [K] - solidus temperature of magma
+        * outdir [String] - directory to save outputs to 
+        * runname [String] - name of run 
+        * maxiters [Int] - maximum iterations of the DDE solver 
+            + optional, default value: 1e7 
+        * alg [OrdinaryDiffEq integration algorithm]
+            note, see https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/ for options
+            + optional, default value: KenCarp4()
+        * reltol [Float] - relative tolerance of the DDE solver 
+            + optional, default value: 1e-8
+        * abstol [Float] - absolute tolerance of the DDE solver 
+            + optional, default value: 1e-10
+        > note, Tsurf(t̂=0) = fTsurf₀ * Tsurfeq + addTsurf₀
+            * fTsurf₀ [ ] - multiplicative factor for Tsurf for initial condition 
+                + optional, default value: 0.99
+            * addTsurf₀ [K] - additive factor for Tsurf for initial condition 
+                + optional, default value: 0 K
+        > note, τSW(t̂=0) = fτSW₀ * τSWeq + addτSW₀
+            * fτSW₀ [ ] - multiplicative factor for shortwave optical depth for initial condition
+                + optional, default value: 0.99
+            * addτSW₀ [ ] - additive factor for shortwave optical depth for initial condition
+                + optional, default value: 0
+        * t̂check1 [delay time] - first time to check DDE ending conditions 
+            + optional, default value: 300 delay times
+        * Δt̂ [delay time] - time duration to use to check ending conditions, note Δt̂ ≤ t̂check1
+            + optional, default value: 100 delay times 
+        * t̂end [delay time] - end time for integration if DDE solution does not stabilize
+            note, important in chaos regimes of parameter space !
+            + optional, default value: 1e4 delay time 
+        * ΔTthres [K] - surface temperature buffer around fixed point for determining end state 
+            note, lower values will cause longer integration
+            do not set below about 10*reltol*Teq 
+            + optional, default value: 1 K 
+        * isverbose [Bool] - whether include extra outputs  
+            + optional, default value: true
+        * fsteps [Int] - factor for number of time steps outputted relative to number of time steps taken by integrator
+            note, can be important for plotting smooth limit cycle phase diagrams
+            + optional, default value: 10 
+        * Rstar [m] - radius of star, used for SW brightness temperature diagnostic 
+            + optional, default value: R55cncA (radius of 55 Cnc A)
+        * aplanet [m] - planet semi-major axis, used for SW brightness temperature diagnostic
+            + optional, default value: a55cnce (semi-major axis of 55 Cnc e)
+        * Tstar [K] - effective temperature of star, used for SW brightness temperature diagnostic
+            + optional, default value: T55cncA (effective temperature of 55 Cnc A)
+        * ratA [ ] - ratio of geometric albedo to substellar point albedo 
+            + optional, default value: 1
+    """
+    Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus = p
+
+    Teq,τeq = findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud)
+
+    # handle Teq<Tmagma_solidus case
+    if Teq<Tmagma_solidus
+        @show Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus
+        error("Teq<Tmagma_solidus")
+    end
+
+    # inner initial coniditions 
+    T₀_inner = Teq*fT₀ + addT₀
+    τ₀_inner = τeq*fτ₀ + addτ₀
+
+    sol_inner = solvedTlogτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀_inner,τ₀_inner,Teq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+  
+    writenc_radbal2(outdir,runname*"_inner",sol_inner,Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Teq,τeq,reltol,abstol,Δt̂,ΔTthres;fsteps=fsteps,isverbose=isverbose,Tstar=Tstar,aplanet=aplanet,Rstar=Rstar,ratA=ratA)
+
+    # outer initial conditions 
+    T₀_outer = Tmagma_solidus + 1.
+    τ₀_outer = 1e-6 
+
+    sol_outer = solvedTlogτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀_outer,τ₀_outer,Teq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+
+    writenc_radbal2(outdir,runname*"_outer",sol_outer,Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Teq,τeq,reltol,abstol,Δt̂,ΔTthres;fsteps=fsteps,isverbose=isverbose,Tstar=Tstar,aplanet=aplanet,Rstar=Rstar,ratA=ratA)
+    
+    nothing 
+end
+
+
 function outputrun_const(p,outdir,runname;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
     abstol=1e-10,fT₀=0.99,fτ₀=0.99,addT₀=0.,addτ₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e7,ΔTthres=1.,
     isverbose=true,fsteps=10,Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.)
@@ -1640,6 +2339,171 @@ function checksol_radbal(p,figdir,runname;maxiters=1e7,alg=KenCarp4(),reltol=1e-
             lines!(axτ,sol.t[filt] .- sol.t[filt][1],τSWfilt,linewidth=lw,color=:black)
             hlines!(axτ,τeq,linestyle=:dash,color=:red)
             save(figdir*"TsurfτSWvt_run$(runname).pdf",fig)
+
+            # plot L with coloring for Tsurf  
+            filt_Tsolidus = abs.(Tfilt .- Tmagma_solidus) .< 10*reltol
+            filt_Tsolidus_1K = (.!filt_Tsolidus) .&& (abs.(Tfilt .- Tmagma_solidus) .< 1.)
+            filt_gtTsolidus = Tfilt .> (Tmagma_solidus+1)
+            filt_ltTsolidus = Tfilt .< (Tmagma_solidus .-1)
+            ms = 5
+            if sum(filt_Tsolidus)>0
+                fig = Figure()
+                ax = Axis(fig[1,1],xlabel="time [delay time]",ylabel=rich(rich("L",font=:italic)," [J m⁻²]"))
+                if tfilt[1]!=tfilt[end]
+                    xlims!(ax,tfilt[1],tfilt[end])
+                    ax.xticks = tfilt[1]:tfilt[end]
+                end
+                lines!(ax,tfilt,Lfilt,color=:black,linewidth=2)
+                scatter!(ax,tfilt[filt_Tsolidus],Lfilt[filt_Tsolidus],color=:red,markersize=ms,
+                label=rich(rich("T",font=:italic),subscript("surf")," = ",rich("T",font=:italic),subscript("solidus")))
+                if sum(filt_Tsolidus_1K)>0
+                    scatter!(ax,tfilt[filt_Tsolidus_1K],Lfilt[filt_Tsolidus_1K],color=:coral1,markersize=ms,
+                    label=rich(rich("T",font=:italic),subscript("surf")," ≈ ",rich("T",font=:italic),subscript("solidus")))
+                end
+                if sum(filt_gtTsolidus)>0
+                    scatter!(ax,tfilt[filt_gtTsolidus],Lfilt[filt_gtTsolidus],color=:blue,markersize=ms,marker=:xcross,
+                    label=rich(rich("T",font=:italic),subscript("surf")," > ",rich("T",font=:italic),subscript("solidus")))
+                end
+                if sum(filt_ltTsolidus)>0
+                    scatter!(ax,tfilt[filt_gtTsolidus],Lfilt[filt_gtTsolidus],color=:deepskyblue3,markersize=ms,marker=:xcross,
+                    label=rich(rich("T",font=:italic),subscript("surf")," < ",rich("T",font=:italic),subscript("solidus")))
+                end
+                axislegend()
+                save(figdir*"Lvt_Tsoldiushighlight_run$(runname).pdf",fig)
+            end
+
+        catch e 
+            println("error in plotting: $e")
+        end
+    else
+        @info "unsuccessful integration!"
+        @show p sol.retcode
+    end
+    
+
+    sol 
+end
+
+
+function checksol_radbal2(p,figdir,runname;maxiters=1e7,alg=KenCarp4(),reltol=1e-8,
+    abstol=1e-10,fT₀=0.99,fτ₀=0.99,addT₀=0.,addτ₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e4,ΔTthres=1.,
+    Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.,Δt̂plot=15.,λ_LW=4.5,λ_SW=0.5e-6,λ_SWname="0.5",lw=2,fsteps=10,
+    isplottimesteps=false)
+    """
+    run radiative balance model, make plots, and return solution object 
+    """
+    Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus = p
+
+
+    Teq,τeq = findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud)
+
+    # handle Teq<Tmagma_solidus case
+    if Teq<Tmagma_solidus
+        @show Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus
+        error("Teq<Tmagma_solidus")
+    end
+    
+
+    T₀ = Teq*fT₀ + addT₀
+    τ₀ = τeq*fτ₀ + addτ₀
+    τ₀ = max(τ₀,abstol)
+
+    sol = solvedTlogτLdt̂_radbal(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀,τ₀,Teq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+
+    # 
+    tchecks = t̂check1:Δt̂:t̂end
+    fig = Figure()
+    ax_max = Axis(fig[1,1],xlabel="block",ylabel="T max [K]")
+    ax_min = Axis(fig[2,1],xlabel="block",ylabel="T min [K]")
+    for (i,tcheck) ∈ enumerate(tchecks[2:end]) 
+        filt2 =  (sol.t .< (tcheck-Δt̂)) .&& (sol.t .>= (tcheck-2*Δt̂))
+        if sum(filt2)>5
+            Tmin_prev,Tmax_prev = extrema(sol[1,filt2])
+            scatter!(ax_max,[i],[Tmax_prev],color=:red)
+            errorbars!(ax_max,[i],[Tmax_prev],[ΔTthres],color=:red,linewidth=3)
+            scatter!(ax_min,[i],[Tmin_prev],color=:blue)
+            errorbars!(ax_min,[i],[Tmin_prev],[ΔTthres],color=:blue,linewidth=3)
+        end
+    end
+    save(figdir*"Textremaovertcheck_run$(runname).pdf",fig)
+
+    if SciMLBase.successful_retcode(sol) # avoid plotting maxiters errors 
+        endstateflag,P = checkendsol_radbal2(sol,ΔTthres,Teq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA)[1:2]
+    
+        try 
+            filt = sol.t .>= max(0,sol.t[end]-Δt̂plot)
+
+            if sum(filt)<2
+                filt[:] .= true
+            end
+
+            tfilt = sol.t[filt]
+
+            tsteps = unique(tfilt)
+            nsteps = length(tsteps)
+            interp_linear = linear_interpolation(1:nsteps, tsteps)
+            ts_interp = interp_linear(LinRange(1,nsteps,nsteps*fsteps))
+
+
+            Tfilt = sol.(ts_interp,idxs=1)
+            logτSWfilt = sol.(ts_interp,idxs=2)
+            τSWfilt = exp.(logτSWfilt)
+            # don't fail plotting from negative / 0 values (only occurs for interpolation)
+            τSWfilt[τSWfilt.<abstol] .= NaN
+            τSWfilt_interp = deepcopy(τSWfilt)
+    
+            Lfilt = sol.(ts_interp,idxs=3)
+            Tcloudupfilt = calcTcloudup.(ΔTcloud,Tfilt)
+            Tbright_4p5 = calcTbrightλ_LW.(4.5e-6,Tfilt,τSWfilt,Tcloudupfilt,β)
+            Tbright_1 = calcTbrightλ_SW.(λ_SW,Tfilt,τSWfilt,α,Rstar,aplanet,Tstar,ratA)
+
+            logτSWfilt = sol[2,filt]
+            τSWfilt = exp.(logτSWfilt)
+            # don't fail plotting from negative / 0 values (only occurs for interpolation)
+            # (should not happen any more...)
+            τSWfilt[τSWfilt.<abstol] .= NaN
+
+            tfilt = ts_interp .- ts_interp[1]
+
+            # plot T bright LW and SW phase space 
+            fig = Figure() 
+            Tbrightlabel_1 = rich(rich("T",font=:italic),subscript("bright"),rich("(λ=$(λ_SWname)",font=:italic),"μm",rich(")",font=:italic)," [K]")
+            Tbrightlabel_4p5 = rich(rich("T",font=:italic),subscript("bright"),rich("(λ=4.5",font=:italic),"μm",rich(")",font=:italic)," [K]")
+            ax = Axis(fig[1,1],xlabel=Tbrightlabel_4p5,ylabel=Tbrightlabel_1)
+            lines!(ax,Tbright_4p5,Tbright_1,color=:black,linewidth=lw)
+            save(figdir*"Tbright1v4p5_run$(runname).pdf",fig)
+
+            # plot Tsurf vs τSW 
+            fig = Figure()
+            ax = Axis(fig[1,1],ylabel=rich(rich("T",font=:italic),subscript("surf")," [K]"),xlabel=rich(rich("τ",font=:italic),subscript("SW")," [ ]"),xscale=log10)
+            lines!(ax,τSWfilt_interp,Tfilt,linewidth=lw,color=:black)
+            hlines!(ax,Teq,linestyle=:dash,color=:red)
+            vlines!(ax,τeq,linestyle=:dash,color=:red)
+            save(figdir*"TsurfτSW_run$(runname).pdf",fig)
+
+            # plot Tsurf and τSW vs t 
+            fig = Figure() 
+            axT = Axis(fig[1,1],xlabel="time [delay time]",ylabel=rich(rich("T",font=:italic),subscript("surf")," [K]"))
+            if tfilt[1]!=tfilt[end]
+                xlims!(axT,tfilt[1],tfilt[end])
+                # axT.xticks = tfilt[1]:tfilt[end]
+            end
+            lines!(axT,tfilt,Tfilt,linewidth=lw,color=:black)
+            if isplottimesteps
+                scatter!(axT,sol.t[filt] .- sol.t[filt][1],sol[1,filt],color=:blue,marker=:xcross,markersize=5)
+            end
+            hlines!(axT,Teq,linestyle=:dash,color=:red)
+            hspan!(axT,Teq-ΔTthres,Teq+ΔTthres,color=(:red,0.25))
+            axτ = Axis(fig[2,1],xlabel="time [delay time]",ylabel=rich(rich("τ",font=:italic),subscript("SW")," [ ]"),yscale=log10)
+            if tfilt[1]!=tfilt[end]
+                xlims!(axτ,tfilt[1],tfilt[end])
+                # axτ.xticks = tfilt[1]:tfilt[end]
+            end
+            lines!(axτ,sol.t[filt] .- sol.t[filt][1],τSWfilt,linewidth=lw,color=:black)
+            hlines!(axτ,τeq,linestyle=:dash,color=:red)
+            save(figdir*"TsurfτSWvt_run$(runname).pdf",fig)
+
+            
 
             # plot L with coloring for Tsurf  
             filt_Tsolidus = abs.(Tfilt .- Tmagma_solidus) .< 10*reltol
@@ -1874,6 +2738,28 @@ function setupparams4sweep_Πonly(nsamp,log_min_Π1_search,log_max_Π1_search,lo
     ps[8,:] .= f
     ps[9,:] .= β
     ps[10,:] .= Tcloud_var
+    ps[11,:] .= Tmagma_solidus
+    ps
+end
+
+function setupparams4sweep_βlog_refα(nsamp,log_min_Π1_search,log_max_Π1_search,log_min_Π2_search,log_max_Π2_search,
+    log_min_Π3_search,log_max_Π3_search,log_min_β_search,log_max_β_search,min_Tcloud_var_search,max_Tcloud_var_search,
+    T_ref_min,T_ref_max,log_p_ref_min,log_p_ref_max,α_min,α_max;
+    S₀=3.4e6,f=1.,Tmagma_solidus=1400.,seed1=42,seed2=300,seed3=13,seed4=789,seed5=9285,seed6=14729)
+    """
+    setup model parameters for sweep with variable T_ref, p_ref, and α
+    """
+    # set up model parameter combinations to run 
+    ps = zeros(11,nsamp)
+    # assign values 
+    ps[1:3,:] = 10 .^ doLHSND([log_min_Π1_search,log_min_Π2_search,log_min_Π3_search],[log_max_Π1_search,log_max_Π2_search,log_max_Π3_search],nsamp;seed=seed1)'
+    ps[4,:] .= doLHSND([T_ref_min],[T_ref_max],nsamp;seed=seed4) # T_ref
+    ps[5,:] .= 10 .^ doLHSND([log_p_ref_min],[log_p_ref_max],nsamp;seed=seed5) # p_ref
+    ps[6,:] .= doLHSND([α_min],[α_max],nsamp;seed=seed6) # α
+    ps[7,:] .= S₀
+    ps[8,:] .= f
+    ps[9,:] .= 10. .^ doLHSND([log_min_β_search],[log_max_β_search],nsamp;seed=seed2) # β
+    ps[10,:] .= doLHSND([min_Tcloud_var_search],[max_Tcloud_var_search],nsamp;seed=seed3) # ΔTcloud
     ps[11,:] .= Tmagma_solidus
     ps
 end
@@ -2203,6 +3089,330 @@ function writenc_radbal(outdir,runname,sol,Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀
 
     nothing
 end
+
+function writenc_radbal2(outdir,runname,sol,Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tsurfeq,τeq,reltol,abstol,Δt̂,ΔTthres;
+    fsteps::Int=10,isverbose=false,Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.)
+    """
+    save extensive individual run details for radiative balance model 
+        + model parameters
+        + integration parameters
+        + solution properties
+        + time evolving solution and diagnostics 
+    to netcdf 
+
+    this can generate a relatively large file
+    do not run for large parameter sweep!
+    """
+
+    # convert solution into what outputted 
+    tsteps = unique(sol.t)
+    nsteps = length(tsteps)
+    interp_linear = linear_interpolation(1:nsteps, tsteps)
+    t̂s = interp_linear(LinRange(1,nsteps,nsteps*fsteps))
+    Tsurfs = sol.(t̂s,idxs=1)
+    
+    logτs = sol.(t̂s,idxs=2)
+    τs = exp.(logτs)
+    τs = max.(0.,τs)
+    Ls = sol.(t̂s,idxs=3)
+    As = calcA.(τs,α)
+
+    filt = t̂s .>= (t̂s[end] - Δt̂)
+    Tsurfmin = minimum(Tsurfs[filt])
+    Tsurfmax = maximum(Tsurfs[filt])
+    Tcloudups = calcTcloudup.(ΔTcloud,Tsurfs)
+    Tclouddowns = calcTclouddown.(ΔTcloud,Tsurfs)
+    T4p5s = calcTbrightλ_LW.(4.5e-6,Tsurfs,τs,Tcloudups,β)
+    T0p5s = calcTbrightλ_SW.(0.5e-6,Tsurfs,τs,α,Rstar,aplanet,Tstar,ratA)
+    T0p5refs = calcTbrightλ_refonly(0.5e-6,τs,α,Rstar,aplanet,Tstar,ratA)
+
+    # determine solution end state (and period if limit cycle) 
+    endstateflag,P,Tsurfmin,Tsurfmax,T4p5min,T4p5max,TbSWmin,TbSWmax,τmin,τmax,Lmin,Lmax = checkendsol_radbal2(sol,ΔTthres,Tsurfeq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA)
+
+    endstate = if endstateflag==2 
+        "limit cycle"
+    elseif endstateflag==1
+        "fixed point"
+    elseif endstateflag==7
+        "irregular oscillations / chaotic regime (tentative)"
+    elseif endstateflag==8
+        "complex limit cycle"
+    else
+         "problem!"
+    end
+
+    # make nc file
+    mkpath(outdir)
+	fnc = outdir*runname*".nc"
+
+    # set up attributes 
+    t̂atts = Dict("longname" => "time",
+	"units"=>"delay time")
+    Tatts = Dict("longname" => "surface temperature",
+	"units"=>"K")
+    T4p5atts = Dict("longname" => "4.5 um brightness temperature, only planetary emission",
+	"units"=>"K")
+    T0p5atts = Dict("longname" => "0.5 um brightness temperature, planetary emission and stellar reflection",
+	"units"=>"K")
+    T0p5refatts = Dict("longname" => "0.5 um brightness temperature, only stellar reflection",
+	"units"=>"K")
+    Tcloudupatts = Dict("longname" => "cloud upward emission temperature",
+	"units"=>"K")
+    Tclouddownatts = Dict("longname" => "cloud downward emission temperature",
+	"units"=>"K")
+    Aatts = Dict("longname" => "albedo",
+	"units"=>"1")
+    τatts = Dict("longname" => "shortwave optical depth",
+	"units"=>"1")
+    Latts = Dict("longname" => "column integrated latent heat toward magma ocean solidification",
+	"units"=>"J/m2")
+
+
+    # add parameters 
+    Π₁atts = Dict("longname" => "bulk parameter 1",
+	"units"=>"1/Pa")
+    Π₂atts = Dict("longname" => "bulk parameter 2",
+	"units"=>"1")
+    Π₃atts = Dict("longname" => "bulk parameter 3",
+	"units"=>"kg/s^3/K")
+    Trefatts = Dict("longname" => "Clausius Clapeyron reference temperature",
+	"units"=>"K")
+    prefatts = Dict("longname" => "Clausius Clapeyron reference pressure",
+	"units"=>"Pa")
+    αatts = Dict("longname" => "multiple scattering albedo factor",
+	"units"=>"1")
+    S₀atts = Dict("longname" => "incident stellar radiation",
+	"units"=>"W/m2")
+    fatts = Dict("longname" => "heat redistribution factor",
+	"units"=>"1")
+    ΔTcloudatts = Dict("longname" => "downward cloud emission temperature minus upward cloud emission temperature",
+	"units"=>"K")
+    βatts = Dict("longname" => "ratio of longwave optical depth to shortwave optical depth (i.e., tau_lw = beta*tau_sw)",
+	"units"=>"1")
+
+    T55cncAatts = Dict("longname" => "55 Cnc A emission temperature",
+	"units"=>"K")
+    a55cnceatts = Dict("longname" => "55 Cnc e orbital semi-major axis",
+	"units"=>"m")
+    R55cncAatts = Dict("longname" => "55 Cnc A radius",
+	"units"=>"m")
+    ratAatts = Dict("longname" => "ratio of geometric albedo to substellar point albedo",
+	"units"=>"1")
+
+    Tsurf0atts = Dict("longname" => "fixed point surface temperature",
+	"units"=>"K")
+    T4p50atts = Dict("longname" => "fixed point 4.5 um brightness temperature",
+	"units"=>"K")
+    τsw0atts = Dict("longname" => "fixed point shortwave cloud optical depth",
+	"units"=>"1")
+
+    # only used if limit cycle 
+    Tsurfminatts = Dict("longname" => "minimum surface temperature",
+	"units"=>"K")
+    Tsurfmaxatts = Dict("longname" => "maximum surface temperature",
+	"units"=>"K")
+    T4p5minatts = Dict("longname" => "minimum 4.5 um brightness temperature",
+	"units"=>"K")
+    T4p5maxatts = Dict("longname" => "maximum 4.5 um brightness temperature",
+	"units"=>"K")
+    τswminatts = Dict("longname" => "minimum shortwave cloud optical depth",
+	"units"=>"1")
+    τswmaxatts = Dict("longname" => "maximum shortwave cloud optical depth",
+	"units"=>"1")
+    Patts = Dict("longname" => "limit cycle period",
+	"units"=>"delay time")
+
+    nccreate(fnc,"Pi1","parameter",atts=Π₁atts)
+	ncwrite([Π₁],fnc,"Pi1")
+
+    nccreate(fnc,"Pi2","parameter",atts=Π₂atts)
+	ncwrite([Π₂],fnc,"Pi2")
+
+    nccreate(fnc,"Pi3","parameter",atts=Π₃atts)
+	ncwrite([Π₃],fnc,"Pi3")
+
+    nccreate(fnc,"T_ref","parameter",atts=Trefatts)
+	ncwrite([T_ref],fnc,"T_ref")
+
+    nccreate(fnc,"p_ref","parameter",atts=prefatts)
+	ncwrite([p_ref],fnc,"p_ref")
+
+    nccreate(fnc,"alpha","parameter",atts=αatts)
+	ncwrite([α],fnc,"alpha")
+
+    nccreate(fnc,"S0","parameter",atts=S₀atts)
+	ncwrite([S₀],fnc,"S0")
+
+    nccreate(fnc,"f","parameter",atts=fatts)
+	ncwrite([f],fnc,"f")
+
+    nccreate(fnc,"Delta_T_cloud","parameter",atts=ΔTcloudatts)
+	ncwrite([ΔTcloud],fnc,"Delta_T_cloud")
+
+    nccreate(fnc,"beta","parameter",atts=βatts)
+	ncwrite([β],fnc,"beta")
+
+    nccreate(fnc,"T55cncA","parameter",atts=T55cncAatts)
+	ncwrite([T55cncA],fnc,"T55cncA")
+
+    nccreate(fnc,"a55cnce","parameter",atts=a55cnceatts)
+	ncwrite([a55cnce],fnc,"a55cnce")
+
+    nccreate(fnc,"R55cncA","parameter",atts=R55cncAatts)
+	ncwrite([R55cncA],fnc,"R55cncA")
+
+    nccreate(fnc,"ratA","parameter",atts=ratAatts)
+	ncwrite([ratA],fnc,"ratA")
+
+
+    # add properties of solution 
+    nccreate(fnc,"T_surf_0","property",atts=Tsurf0atts)
+	ncwrite([Tsurfeq],fnc,"T_surf_0")
+
+    Tcloudup_eq = calcTcloudup(ΔTcloud,Tsurfeq)
+    T4p5_eq = calcTbrightλ_LW.(4.5e-6,Tsurfeq,τeq,Tcloudup_eq,β)
+
+    nccreate(fnc,"T_4p5_0","property",atts=T4p50atts)
+	ncwrite([T4p5_eq],fnc,"T_4p5_0")
+   
+    nccreate(fnc,"tau_sw_0","property",atts=τsw0atts)
+	ncwrite([τeq],fnc,"tau_sw_0")
+
+    nccreate(fnc,"P","property",atts=Patts)
+	ncwrite([P],fnc,"P")
+
+    nccreate(fnc,"T_4p5_min","property",atts=T4p5minatts)
+	ncwrite([T4p5min],fnc,"T_4p5_min")
+
+    nccreate(fnc,"T_4p5_max","property",atts=T4p5maxatts)
+	ncwrite([T4p5max],fnc,"T_4p5_max")
+
+    nccreate(fnc,"T_surf_min","property",atts=Tsurfminatts)
+	ncwrite([Tsurfmin],fnc,"T_surf_min")
+
+    nccreate(fnc,"T_surf_max","property",atts=Tsurfmaxatts)
+	ncwrite([Tsurfmax],fnc,"T_surf_max")
+
+    nccreate(fnc,"tau_sw_min","property",atts=τswminatts)
+	ncwrite([τmin],fnc,"tau_sw_min")
+    
+    nccreate(fnc,"tau_sw_max","property",atts=τswmaxatts)
+	ncwrite([τmax],fnc,"tau_sw_max")
+	
+	# add surface Ts
+	nccreate(fnc,"T_surf","t-hat",t̂s,t̂atts,atts=Tatts)
+	ncwrite(Tsurfs,fnc,"T_surf")
+
+    # add 4.5 um brightness Ts
+    nccreate(fnc,"T_4p5","t-hat",t̂s,t̂atts,atts=T4p5atts)
+	ncwrite(T4p5s,fnc,"T_4p5")
+
+    # add 0.5 um brightness Ts
+    nccreate(fnc,"T_0p5","t-hat",t̂s,t̂atts,atts=T0p5atts)
+	ncwrite(T0p5s,fnc,"T_0p5")
+
+    # add 0.5 um brightness Ts only reflection 
+    nccreate(fnc,"T_0p5_refonly","t-hat",t̂s,t̂atts,atts=T0p5refatts)
+	ncwrite(T0p5refs,fnc,"T_0p5_refonly")
+
+    # add Tcloud up 
+    nccreate(fnc,"T_cloud_up","t-hat",t̂s,t̂atts,atts=Tcloudupatts)
+	ncwrite(Tcloudups,fnc,"T_cloud_up")
+
+    # add Tcloud down 
+    nccreate(fnc,"T_cloud_down","t-hat",t̂s,t̂atts,atts=Tclouddownatts)
+	ncwrite(Tclouddowns,fnc,"T_cloud_down")
+
+    # add L 
+    nccreate(fnc,"L","t-hat",t̂s,t̂atts,atts=Latts)
+	ncwrite(Ls,fnc,"L")
+
+	# add τs 
+	nccreate(fnc,"tau_sw","t-hat",t̂s,t̂atts,atts=τatts)
+	ncwrite(τs,fnc,"tau_sw")
+
+	# add As
+	nccreate(fnc,"A","t-hat",t̂s,t̂atts,atts=Aatts)
+	ncwrite(As,fnc,"A")
+
+    # add solver info 
+    ncputatt(fnc,"global",Dict("endstate"=>endstate,"reltol"=>reltol,"abstol"=>abstol,"model_type"=>"rad_bal"))
+
+    if isverbose # output extra outputs for understanding model behavior 
+        Tdelays = sol.(max.(t̂s .- 1,0.),idxs=1)
+        nt = length(t̂s)
+        τLWs = zeros(nt)
+        FcloudLW_downs = zeros(nt)
+        FcloudLW_ups = zeros(nt)
+        FsurfLWemits = zeros(nt)
+        FsurfSWs = zeros(nt)
+        FsurfLWTOAs = zeros(nt)
+        FLWTOAs = zeros(nt)
+        dτdt̂_sources = zeros(nt)
+        dτdt̂_sinks = zeros(nt)
+
+        for i ∈ 1:nt
+            τLWs[i],FcloudLW_downs[i],FcloudLW_ups[i],FsurfLWemits[i],FsurfSWs[i],FsurfLWTOAs[i],FLWTOAs[i],dτdt̂_sources[i],dτdt̂_sinks[i] = calcdTτLdt̂_radbal_sourcesink(Tsurfs[i],τs[i],Tdelays[i],Π₁,Π₂,p_ref,T_ref,α,S₀,f,β,ΔTcloud)
+        end
+
+        τLWatts = Dict("longname" => "longwave optical depth",
+	    "units"=>"1")
+
+        FsurfSWatts = Dict("longname" => "stellar radiative energy flux absorbed by the surface",
+        "units"=>"W/m2")
+
+        FsurfLWemitatts = Dict("longname" => "emitted radiative energy flux from the surface",
+        "units"=>"W/m2")
+
+        FcloudLWemitdownatts = Dict("longname" => "radiative energy flux emitted by the cloud that is absorbed by the surface",
+        "units"=>"W/m2")
+
+        FcloudLWemitupatts = Dict("longname" => "contribution of cloud emission to the outgoing radiative flux above the cloud",
+        "units"=>"W/m2")
+
+        FsurfLWemitTOAatts = Dict("longname" => "contribution of surface emission to the outgoing radiative flux above the cloud",
+        "units"=>"W/m2")
+
+        FplanetLWemitatts = Dict("longname" => "total outgoing radiative flux above the cloud",
+        "units"=>"W/m2")
+
+
+        dτdt̂_source_atts = Dict("longname" => "optical depth time derivative source term",
+	    "units"=>"1 / delay time")
+        dτdt̂_sink_atts = Dict("longname" => "optical depth time derivative sink term",
+	    "units"=>"1 / delay time")
+
+        nccreate(fnc,"tau_lw","t-hat",t̂s,t̂atts,atts=τLWatts)
+	    ncwrite(τLWs,fnc,"tau_lw")
+
+        nccreate(fnc,"Fsurf_sw","t-hat",t̂s,t̂atts,atts=FsurfSWatts)
+	    ncwrite(FsurfSWs,fnc,"Fsurf_sw")
+
+        nccreate(fnc,"Fsurf_lw_emit","t-hat",t̂s,t̂atts,atts=FsurfLWemitatts)
+	    ncwrite(FsurfLWemits,fnc,"Fsurf_lw_emit")
+
+        nccreate(fnc,"Fcloud_lw_emit_down","t-hat",t̂s,t̂atts,atts=FcloudLWemitdownatts)
+	    ncwrite(FcloudLW_downs,fnc,"Fcloud_lw_emit_down")
+
+        nccreate(fnc,"Fcloud_lw_emit_up","t-hat",t̂s,t̂atts,atts=FcloudLWemitupatts)
+	    ncwrite(FcloudLW_ups,fnc,"Fcloud_lw_emit_up")
+
+        nccreate(fnc,"Fsurf_lw_emit_TOA","t-hat",t̂s,t̂atts,atts=FsurfLWemitTOAatts)
+	    ncwrite(FsurfLWTOAs,fnc,"Fsurf_lw_emit_TOA")
+
+        nccreate(fnc,"Fplanet_lw_TOA","t-hat",t̂s,t̂atts,atts=FplanetLWemitatts)
+	    ncwrite(FLWTOAs,fnc,"Fplanet_lw_TOA")
+
+        nccreate(fnc,"dtaudt-hat_source","t-hat",t̂s,t̂atts,atts=dτdt̂_source_atts)
+	    ncwrite(dτdt̂_sources,fnc,"dtaudt-hat_source")
+
+        nccreate(fnc,"dtaudt-hat_sink","t-hat",t̂s,t̂atts,atts=dτdt̂_sink_atts)
+	    ncwrite(dτdt̂_sinks,fnc,"dtaudt-hat_sink")
+    end
+
+    nothing
+end
+
 
 function writenc_const(outdir,runname,sol,Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,Tcloud,Tsurfeq,τeq,reltol,abstol,Δt̂,ΔTthres;
     fsteps::Int=10,isverbose=false,Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.)
@@ -2697,6 +3907,7 @@ function writenc_sweep(solprop_pmap,ps,outdir,sweepname,modeltype;notes="")
 end
 
 
+
 # FUNCTIONS TO SAVE SOLUTIONS #####################################
 
 ###################################################################
@@ -2718,14 +3929,17 @@ function get_variedparam_obsfilt(sweepname,outdir,Tmin_max_obs,Tmax_min_obs)
     # load 4.5 μm brightness temperatures to check obs consistency 
     T_04p5_min = ncread(fnc,"T_4p5_min")
     T_04p5_max = ncread(fnc,"T_4p5_max")
+    P = ncread(fnc,"P")
     # load end state flags to ensure limit cycles 
     endstateflag = ncread(fnc,"end_state_flag")
     # get model type 
     model_type = ncgetatt(fnc,"Global","model_type")
 
+    β = ncread(fnc,"beta")
+
     # filter min and max 4.5 μm brightness temperatures for consistency with inputted observation limits
     # also make sure results are limit cycles 
-    iobs = (T_04p5_min .< Tmin_max_obs) .&& (T_04p5_max .> Tmax_min_obs) .&& (endstateflag .== 2)
+    iobs = (T_04p5_min .< Tmin_max_obs) .&& (T_04p5_max .> Tmax_min_obs) .&& (endstateflag .== 2) .&& ((β .< 1) .|| (P .> 0.8)) 
 
     # read in appropriate cloud parameter (ΔTcloud or Tcloud)
     # depending on model type 
@@ -2740,6 +3954,47 @@ function get_variedparam_obsfilt(sweepname,outdir,Tmin_max_obs,Tmax_min_obs)
     β = ncread(fnc,"beta")[iobs]
 
     Π1,Π2,Π3,cloud_param,β
+end
+
+function get_variedparam2_obsfilt(sweepname,outdir,Tmin_max_obs,Tmax_min_obs)
+    """
+    load parameter combinations consistent with observations  
+    (including pref, Tref, and α)
+    """
+    # file name 
+    fnc = outdir*sweepname*".nc"
+    # load 4.5 μm brightness temperatures to check obs consistency 
+    T_04p5_min = ncread(fnc,"T_4p5_min")
+    T_04p5_max = ncread(fnc,"T_4p5_max")
+    # load end state flags to ensure limit cycles 
+    endstateflag = ncread(fnc,"end_state_flag")
+    # get model type 
+    model_type = ncgetatt(fnc,"Global","model_type")
+
+    P = ncread(fnc,"P")
+    β = ncread(fnc,"beta")
+
+    # filter min and max 4.5 μm brightness temperatures for consistency with inputted observation limits
+    # also make sure results are limit cycles 
+    iobs = (T_04p5_min .< Tmin_max_obs) .&& (T_04p5_max .> Tmax_min_obs) .&& (endstateflag .== 2) .&& ((β .< 1) .|| (P .> 0.8))
+
+    # read in appropriate cloud parameter (ΔTcloud or Tcloud)
+    # depending on model type 
+    cloud_param = if model_type == "rad_bal"
+        ncread(fnc,"Delta_T_cloud")[iobs]
+    else model_type == "const"
+        ncread(fnc,"T_cloud")[iobs]
+    end
+    Π1 = ncread(fnc,"Pi1")[iobs]
+    Π2 = ncread(fnc,"Pi2")[iobs]
+    Π3 = ncread(fnc,"Pi3")[iobs]
+    β = ncread(fnc,"beta")[iobs]
+    pref = ncread(fnc,"p_ref")[iobs]
+    Tref = ncread(fnc,"T_ref")[iobs]
+    α = ncread(fnc,"alpha")[iobs]
+    
+
+    Π1,Π2,Π3,cloud_param,β,pref,Tref,α
 end
 
 function get_properties_obsfilt(outdir,sweepname,Tmin_max_obs,Tmax_min_obs)
@@ -2768,11 +4023,14 @@ function find_obsfilt(sweepname,outdir,Tmin_max_obs,Tmax_min_obs)
     # load end state flags to ensure limit cycles 
     endstateflag = ncread(fnc,"end_state_flag")
 
+    P = ncread(fnc,"P")
+    β = ncread(fnc,"beta")
+
     # filter min and max 4.5 μm brightness temperatures for consistency with inputted observation limits
     # when solutions are limit cycles 
     # true = consistent 
     # false = not consistent 
-    (T_04p5_min .< Tmin_max_obs) .&& (T_04p5_max .> Tmax_min_obs) .&& (endstateflag .== 2)
+    (T_04p5_min .< Tmin_max_obs) .&& (T_04p5_max .> Tmax_min_obs) .&& (endstateflag .== 2) .&& ((β .< 1) .|| (P .> 0.8))
 end
 
 function print_variedparam_ranges_obsfilt(sweepname,outdir;fday=1.1,Tmin_max_obs=873.,
@@ -2855,6 +4113,8 @@ function print_property_ranges_obsfilt(sweepname,outdir;fday=1.1,Tmin_max_obs=87
             println("\t$(prop_names[iprop]):")
             if length(props[iprop])>0
                 println("\t\tmin = $(minimum(props[iprop]))")
+                println("\t\tq5 = $(quantile(props[iprop],0.05))")
+                println("\t\tq95 = $(quantile(props[iprop],0.95))")
                 println("\t\tmax = $(maximum(props[iprop]))")
             else
                 println("\t\tno consistent runs")
@@ -3065,6 +4325,158 @@ function check_param_sweep(sweepname,outdir;isplot=true,maxfig=50,maxparamprint=
 
 end
 
+function check_param_sweep2(sweepname,outdir;isplot=true,maxfig=50,maxparamprint=5,figdirbase="sfigs/",
+    fday=1.1,Tmin_max_obs=873.,σTmin_max_obs=167.,Tmax_min_obs=2816.,σTmax_min_obs=368.,
+    nσ_plot=3,alg=KenCarp4(),reltol=1e-8,abstol=1e-10,t̂end=1e4)
+    """
+    check results of parameter sweep 
+        + print end state flags 
+        + print tests checking model behavior 
+            > bad end state flags 
+            > Tsurf / L integration switch misbehaviors when Tsurf = Tsolidus
+        + make plots for problematic runs (up to maxfig)
+        + print parameter ranges consistent with observations 
+        + print solution properties for solutions consistent with observations
+    """
+    fnc = outdir*sweepname*".nc"
+    Tsurf_min = ncread(fnc,"T_surf_min")
+    T_solidus = ncread(fnc,"T_solidus")
+    Lmin = ncread(fnc,"L_min")
+    Lmax = ncread(fnc,"L_max")
+    endstateflag = ncread(fnc,"end_state_flag")
+
+    # get model type 
+    model_type = ncgetatt(fnc,"Global","model_type")
+    
+
+    nsamp = length(T_solidus)
+
+    # check model runs via end state flags 
+    uni_flags = unique(endstateflag)
+    println("end state flags encountered: $(uni_flags)")
+
+    println("$(sum(endstateflag.==1))/$(nsamp) runs reach steady state")
+    println("$(sum(endstateflag.==2))/$(nsamp) runs reach limit cycles")
+    println("$(sum(endstateflag.==8))/$(nsamp) runs reach complex limit cycles")
+    println("$(sum(endstateflag.==-1))/$(nsamp) runs fail to integrate")
+    println("$(sum(endstateflag.==-2))/$(nsamp) runs have equilibrium Tsurf < Tsolidus")
+    println("$(sum(endstateflag.==0))/$(nsamp) runs can't be classified")
+    println("$(sum(endstateflag.==3))/$(nsamp) runs have erratic periods but are ending early")
+    println("$(sum(endstateflag.==4))/$(nsamp) runs can't be classified and reach t̂end")
+    println("$(sum(endstateflag.==5))/$(nsamp) runs reach steady state but at t̂end")
+    println("$(sum(endstateflag.==6))/$(nsamp) runs reach limit cycles but at t̂end")
+    println("$(sum(endstateflag.==9))/$(nsamp) runs reach complex limit cycles but at t̂end")
+    println("$(sum(endstateflag.==7))/$(nsamp) runs have erratic periods and reach t̂end (possible chaotic regime)\n")
+
+    if isplot
+        # make fig directory 
+        figdir = figdirbase*sweepname*"/"
+        mkpath(figdir)
+        ps = get_parameters(sweepname,outdir)
+        # plot problems (note 5-8 are not problems per se but want to see cases)
+        flag_probs = [-1,0,3,4,5,6,7,8]
+        for flag_prob ∈ flag_probs
+            if flag_prob ∈ uni_flags
+                p_flag = ps[endstateflag.==flag_prob,:]
+                n_flag = size(p_flag)[1]
+                println("plotting flag $flag_prob")
+                for irun ∈ 1:(min(n_flag,maxfig))
+                    runname = "$(round(Int(flag_prob)))_$(irun)"
+                    if irun < maxparamprint
+                        @show p_flag[irun,:]
+                    end
+                    if flag_prob ∉ [-1,7]
+                        if model_type=="rad_bal"
+                            calcsolprop_radbal2(p_flag[irun,:];isplot=true,figdir=figdir,runname=runname,reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                            checksol_radbal2(p_flag[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                        elseif model_type=="const"
+                            calcsolprop_const(p_flag[irun,:];isplot=true,figdir=figdir,runname=runname,reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                            checksol_const(p_flag[irun,:],figdir,runname,reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                        end
+                    end
+                end
+                println("\n")
+            end
+        end
+        # plot limit cycles 
+        iobs = find_obsfilt(sweepname,outdir,fday*(Tmin_max_obs + nσ_plot*σTmin_max_obs),Tmax_min_obs - nσ_plot*σTmax_min_obs)
+        p_lc_obs = ps[iobs,:]
+        n_lc_obs = size(p_lc_obs)[1]
+        println("plotting limit cycles")
+        for irun ∈ 1:(min(n_lc_obs,maxfig))
+            if model_type=="rad_bal"
+                checksol_radbal2(p_lc_obs[irun,:],figdir,"lc_$(irun)";reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            elseif model_type=="const"
+                checksol_const(p_lc_obs[irun,:],figdir,"lc_$(irun)";reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            end
+        end
+        println("\n")
+    end
+    
+
+    # check T solidus 
+    Tsolidus_check = Tsurf_min .< (T_solidus .- 1.)
+    if any(Tsolidus_check) 
+        println("some model solutions ($(sum(Tsolidus_check))/$(nsamp)) have minimum surface temperatures below magma solidus parameter")
+        nprint = min(sum(Tsolidus_check),maxparamprint)
+        p_freeze = ps[Tsolidus_check,:]
+        for irun ∈ 1:nprint
+            @show p_freeze[irun,:]
+            runname = "freeze_$(irun)"
+            if model_type=="rad_bal"
+                checksol_radbal2(p_freeze[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            elseif model_type=="const"
+                checksol_const(p_freeze[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            end
+        end
+        println("\n")
+    end
+
+    # check Lmin 
+    Lmin_check1 = (Lmin .< 0) .&& (abs.(Lmin)./Lmax .> 1e-6)
+    if any(Lmin_check1) 
+        println("some model solutions ($(sum(Lmin_check1))/$(nsamp)) have issues balancing latent heat")
+        nprint = min(sum(Lmin_check1),maxparamprint)
+        p_negL = ps[Lmin_check1,:]
+        for irun ∈ 1:nprint
+            @show p_negL[irun,:]
+            runname = "negL1_$(irun)"
+            if model_type=="rad_bal"
+                checksol_radbal2(p_negL[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            elseif model_type=="const"
+                checksol_const(p_negL[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            end
+        end
+        println("\n")
+    end
+    Lmin_check2 = Lmin .< -1e-3
+    if any(Lmin_check2) 
+        println("some model solutions ($(sum(Lmin_check2))/$(nsamp)) have negative accumulated latent heat, which shouldn't happen by sign convention")
+        nprint = min(sum(Lmin_check2),maxparamprint)
+        p_negL = ps[Lmin_check2,:]
+        for irun ∈ 1:nprint
+            @show p_negL[irun,:]
+            runname = "negL2_$(irun)"
+            if model_type=="rad_bal"
+                checksol_radbal2(p_negL[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            elseif model_type=="const"
+                checksol_const(p_negL[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+            end
+        end
+    end
+
+    # print parameter ranges consistent with obs
+    print_variedparam_ranges_obsfilt(sweepname,outdir)
+
+    println("\n")
+
+    # print property ranges consistent with obs 
+    print_property_ranges_obsfilt(sweepname,outdir)
+
+    nothing
+
+end
+
 function compare_param_sweep(sweepname1,outdir1,sweepname2,outdir2;
     fday=1.1,Tmin_max_obs=873.,σTmin_max_obs=167.,Tmax_min_obs=2816.,σTmax_min_obs=368.,nσ_plot=3)
     """
@@ -3079,6 +4491,10 @@ function compare_param_sweep(sweepname1,outdir1,sweepname2,outdir2;
     endstateflag1,P1,Tsurf_min1,Tsurf_max1,T_4p5_min1,T_4p5_max1,T_0p5_min1,T_0p5_max1,τSW_min1,τSW_max1,Lmin1,Lmax1 = get_properties(sweepname1,outdir1)
     endstateflag2,P2,Tsurf_min2,Tsurf_max2,T_4p5_min2,T_4p5_max2,T_0p5_min2,T_0p5_max2,τSW_min2,τSW_max2,Lmin2,Lmax2 = get_properties(sweepname2,outdir2)
 
+    ps1 = get_parameters(sweepname1,outdir1)'
+    αs = ps1[6,:]
+    βs = ps1[9,:]
+
 
     if length(iobs1) == length(iobs2)
         println("COMPARE $(fnc1) vs $(fnc2)")
@@ -3088,25 +4504,61 @@ function compare_param_sweep(sweepname1,outdir1,sweepname2,outdir2;
             nflagdiff = sum(endstateflag1 .!= endstateflag2)
             nsamp = length(endstateflag1)
             println("\n$(nflagdiff)/$(nsamp) runs have different end flags")
+
+            # check flag 7 specifically 
+            flag7_1 = endstateflag1 .== 7 
+            flag7_2 = endstateflag2 .== 7 
+
+            nflag7diff = sum(flag7_1 .!= flag7_2)
+            
+            println("\n$(nflag7diff)/$(nsamp) runs disagree on flag 7")
+
+
         end
 
-        maxrelerr_Tsurfmin = round(maximum(abs.((Tsurf_min1 .- Tsurf_min2)./Tsurf_min2)[endstateflag1.>-1]),sigdigits=3)
-        println("maximum relative difference in min surface T = $(maxrelerr_Tsurfmin)")
+        filt = (endstateflag1 .> -1) .&& (endstateflag1 .!== 7.) .&& (endstateflag1 .!== 8.) .&& (endstateflag1 .!== 4.) .&& ((βs .< 1).||(P1 .>= 0.8))
 
-        maxrelerr_Tsurfmax = round(maximum(abs.((Tsurf_max1 .- Tsurf_max2)./Tsurf_max2)[endstateflag1.>=-1]),sigdigits=3)
-        println("maximum relative difference in max surface T = $(maxrelerr_Tsurfmax)")
 
-        maxrelerr_T4p5_min = round(maximum(abs.((T_4p5_min1 .- T_4p5_min2)./T_4p5_min2)[endstateflag1.>=-1]),sigdigits=3)
-        println("maximum relative difference in min 4.5 μm brightness T = $(maxrelerr_T4p5_min)")
+        relerr_Tsurfmin = abs.((Tsurf_min1 .- Tsurf_min2)./Tsurf_min2)[filt]
+        abserr_Tsurfmin = abs.((Tsurf_min1 .- Tsurf_min2))[filt]
+        maxrelerr_Tsurfmin = round(maximum(relerr_Tsurfmin),sigdigits=3)
+        maxabserr_Tsurfmin = round(maximum(abserr_Tsurfmin),sigdigits=3)
+        meanrelerr_Tsurfmin = round(mean(relerr_Tsurfmin),sigdigits=3)
+        println("maximum magntiude relative difference in min surface T = $(maxrelerr_Tsurfmin)")
+        println("maximum magntiude absolute difference in min surface T = $(maxabserr_Tsurfmin) K")
+        println("mean magntiude relative difference in min surface T = $(meanrelerr_Tsurfmin)")
 
-        maxrelerr_T4p5_max = round(maximum(abs.((T_4p5_max1 .- T_4p5_max2)./T_4p5_max2)[endstateflag1.>=-1]),sigdigits=3)
-        println("maximum relative difference in max 4.5 μm brightness T = $(maxrelerr_T4p5_max)")
+        relerr_Tsurfmax = abs.((Tsurf_max1 .- Tsurf_max2)./Tsurf_max2)[filt]
+        maxrelerr_Tsurfmax = round(maximum(relerr_Tsurfmax),sigdigits=3)
+        meanrelerr_Tsurfmax = round(mean(relerr_Tsurfmax),sigdigits=3)
+        println("maximum magntiude relative difference in max surface T = $(maxrelerr_Tsurfmax)")
+        println("mean magntiude relative difference in max surface T = $(meanrelerr_Tsurfmax)")
 
-        maxrelerr_T0p5_min = round(maximum(abs.((T_0p5_min1 .- T_0p5_min2)./T_0p5_min2)[endstateflag1.>=-1]),sigdigits=3)
-        println("maximum relative difference in min 0.5 μm brightness T = $(maxrelerr_T0p5_min)")
+        relerr_T4p5_min = abs.((T_4p5_min1 .- T_4p5_min2)./T_4p5_min2)[filt]
+        maxrelerr_T4p5_min = round(maximum(relerr_T4p5_min),sigdigits=3)
+        meanrelerr_T4p5_min = round(mean(relerr_T4p5_min),sigdigits=3)
+        println("maximum magnitude relative difference in min 4.5 μm brightness T = $(maxrelerr_T4p5_min)")
+        println("mean magnitude relative difference in min 4.5 μm brightness T = $(meanrelerr_T4p5_min)")
 
-        maxrelerr_T405_max = round(maximum(abs.((T_0p5_max1 .- T_0p5_max2)./T_0p5_max2)[endstateflag1.>=-1]),sigdigits=3)
-        println("maximum relative difference in max 0.5 μm brightness T = $(maxrelerr_T405_max)")
+        relerr_T4p5_max = abs.((T_4p5_max1 .- T_4p5_max2)./T_4p5_max2)[filt]
+        maxrelerr_T4p5_max = round(maximum(relerr_T4p5_max),sigdigits=3)
+        meanrelerr_T4p5_max = round(mean(relerr_T4p5_max),sigdigits=3)
+        println("maximum magnitude relative difference in max 4.5 μm brightness T = $(maxrelerr_T4p5_max)")
+        println("mean magnitude relative difference in max 4.5 μm brightness T = $(meanrelerr_T4p5_max)")
+
+        relerr_T0p5_min = abs.((T_0p5_min1 .- T_0p5_min2)./T_0p5_min2)[filt]
+        maxrelerr_T0p5_min = round(maximum(relerr_T0p5_min),sigdigits=3)
+        meanrelerr_T0p5_min = round(mean(relerr_T0p5_min),sigdigits=3)
+        println("maximum magnitude relative difference in min 0.5 μm brightness T = $(maxrelerr_T0p5_min)")
+        println("mean magnitude relative difference in min 0.5 μm brightness T = $(meanrelerr_T0p5_min)")
+
+        relerr_T4p5_max = abs.((T_0p5_max1 .- T_0p5_max2)./T_0p5_max2)[filt]
+        maxrelerr_T4p5_max = round(maximum(relerr_T4p5_max),sigdigits=3)
+        meanrelerr_T4p5_max = round(mean(relerr_T4p5_max),sigdigits=3)
+        println("maximum magnitude relative difference in max 0.5 μm brightness T = $(maxrelerr_T4p5_max)")
+        println("mean magnitude relative difference in max 0.5 μm brightness T = $(meanrelerr_T4p5_max)")
+
+        println("\n\n")
 
 
         if iobs1 == iobs2
@@ -3474,6 +4926,277 @@ function make_Π_Tcloudβ_3σ_figs_radbal_nolw_poly(outdir_nolw,outdir_radbal,fi
     
 end
 
+
+function make_Π_Tcloudβ_pTrefα_3σ_figs_radbal_nolw_poly(outdir_nolw,outdir_radbal,figdir,sweepname_nolw,sweepname_radbal;plotname="",fday=1.1,Tmin_max_obs=873.,
+    σTmin_max_obs=167.,Tmax_min_obs=2816.,σTmax_min_obs=368.,cmap=:lajolla,
+    xtickrotation=π/4.,ngrid=25,lw=2,islogβ=true,figsize=(800,700),
+    logΠ1min=nothing,logΠ1max=nothing,logΠ2min=nothing,logΠ2max=nothing,
+    logΠ3min=nothing,logΠ3max=nothing,βmin=nothing,βmax=nothing,
+    ΔTcloudmin=nothing,ΔTcloudmax=nothing,ΔTcloudticks=[0,100,200,300],
+    αpoly=0.6,αline=1,lw_nolw=2,cobs=reverse(cgrad(cmap,5,categorical=true)[2:4]),clw=:black,
+    prefmin=nothing,prefmax=nothing,Trefmin=nothing,Trefmax=nothing,αmin=nothing,αmax=nothing,
+    m=:star5,ms=5,mcolor=:black,prefdefault=log10(p_ref_SiO_0vap),Trefdefault=T_ref_SiO_0vap/1e4,αdefault=0.5,
+    cdef=:black,lw_def=2)
+
+    # set labels 
+    labelΠ1 = rich("log(",rich("Π", subscript("1"),font=:italic)," [Pa",superscript("-1"),"])")
+    labelΠ2 = rich("log(",rich("Π", subscript("2"),font=:italic)," [–])")
+    labelΠ3 = rich("log(",rich("Π", subscript("3"),font=:italic)," [kg s",superscript("-3")," K",superscript("-1"),"])")
+    labelΔTcloud = rich(rich("ΔT",font=:italic),subscript("cloud")," [K]")
+    labelβ = if islogβ
+        rich("log(",rich("β",font=:italic)," [–])")
+    else
+        rich(rich("β",font=:italic)," [–]")
+    end
+    labelpref = rich("log(",rich("p",font=:italic), subscript("ref")," [Pa])")
+    labelTref = rich(rich("T",font=:italic), subscript("ref")," [10⁴ K])")
+    labelα = rich(rich("α",font=:italic)," [–]")
+    
+
+    # make figdir if needed 
+    mkpath(figdir)
+
+    # set up figure and axes
+    fig = Figure(size=figsize) 
+    ax_21 = Axis(fig[1,1],xlabel=labelΠ1,ylabel=labelΠ2)
+    ax_31 = Axis(fig[2,1],xlabel=labelΠ1,ylabel=labelΠ3)
+    ax_32 = Axis(fig[2,2],xlabel=labelΠ2,ylabel=labelΠ3)
+
+
+    ax_β1 = Axis(fig[3,1],xlabel=labelΠ1,ylabel=labelβ)
+    ax_β2 = Axis(fig[3,2],xlabel=labelΠ2,ylabel=labelβ)
+    ax_β3 = Axis(fig[3,3],xlabel=labelΠ3,ylabel=labelβ)
+
+    ax_ΔT1 = Axis(fig[4,1],xlabel=labelΠ1,ylabel=labelΔTcloud,yticks=ΔTcloudticks)
+    ax_ΔT2 = Axis(fig[4,2],xlabel=labelΠ2,ylabel=labelΔTcloud)
+    ax_ΔT3 = Axis(fig[4,3],xlabel=labelΠ3,ylabel=labelΔTcloud)
+    ax_ΔTβ = Axis(fig[4,4],xlabel=labelβ,ylabel=labelΔTcloud)
+
+    ax_pref1 = Axis(fig[5,1],xlabel=labelΠ1,ylabel=labelpref)
+    ax_pref2 = Axis(fig[5,2],xlabel=labelΠ2,ylabel=labelpref)
+    ax_pref3 = Axis(fig[5,3],xlabel=labelΠ3,ylabel=labelpref)
+    ax_prefβ = Axis(fig[5,4],xlabel=labelβ,ylabel=labelpref)
+    ax_prefΔT = Axis(fig[5,5],xlabel=labelΔTcloud,ylabel=labelpref)
+
+    ax_Tref1 = Axis(fig[6,1],xlabel=labelΠ1,ylabel=labelTref)
+    ax_Tref2 = Axis(fig[6,2],xlabel=labelΠ2,ylabel=labelTref)
+    ax_Tref3 = Axis(fig[6,3],xlabel=labelΠ3,ylabel=labelTref)
+    ax_Trefβ = Axis(fig[6,4],xlabel=labelβ,ylabel=labelTref)
+    ax_TrefΔT = Axis(fig[6,5],xlabel=labelΔTcloud,ylabel=labelTref)
+    ax_Trefpref = Axis(fig[6,6],xlabel=labelpref,ylabel=labelTref)
+
+    ax_α1 = Axis(fig[7,1],xlabel=labelΠ1,ylabel=labelα)
+    ax_α2 = Axis(fig[7,2],xlabel=labelΠ2,ylabel=labelα)
+    ax_α3 = Axis(fig[7,3],xlabel=labelΠ3,ylabel=labelα)
+    ax_αβ = Axis(fig[7,4],xlabel=labelβ,ylabel=labelα)
+    ax_αΔT = Axis(fig[7,5],xlabel=labelΔTcloud,ylabel=labelα,xticks=ΔTcloudticks)
+    ax_αpref = Axis(fig[7,6],xlabel=labelpref,ylabel=labelα)
+    ax_αTref = Axis(fig[7,7],xlabel=labelTref,ylabel=labelα)
+
+
+
+    # set axis limits
+    for ax ∈ [ax_21,ax_31,ax_β1,ax_ΔT1,ax_pref1,ax_Tref1,ax_α1]
+        xlims!(ax,logΠ1min,logΠ1max)
+    end
+
+    for ax ∈ [ax_32,ax_β2,ax_ΔT2,ax_pref2,ax_Tref2,ax_α2]
+        xlims!(ax,logΠ2min,logΠ2max)
+    end
+
+    for ax ∈ [ax_β3,ax_ΔT3,ax_pref3,ax_Tref3,ax_α3]
+        xlims!(ax,logΠ3min,logΠ3max)
+    end
+
+    for ax ∈ [ax_ΔTβ,ax_prefβ,ax_Trefβ,ax_αβ]
+        xlims!(ax,βmin,βmax)
+    end
+
+    for ax ∈ [ax_prefΔT,ax_TrefΔT,ax_αΔT]
+        xlims!(ax,ΔTcloudmin,ΔTcloudmax)
+    end
+
+    for ax ∈ [ax_Trefpref,ax_αpref]
+        xlims!(ax,prefmin,prefmax)
+    end
+
+    xlims!(ax_αTref,Trefmin,Trefmax)
+
+
+    ylims!(ax_21,logΠ2min,logΠ2max)
+
+
+    for ax ∈ [ax_31,ax_32]
+        ylims!(ax,logΠ3min,logΠ3max)
+    end
+
+    for ax ∈ [ax_β1,ax_β2,ax_β3]
+        ylims!(ax,βmin,βmax)
+    end
+
+
+    for ax ∈ [ax_ΔT1,ax_ΔT2,ax_ΔT3,ax_ΔTβ]
+        ylims!(ax,ΔTcloudmin,ΔTcloudmax)
+    end
+
+    for ax ∈ [ax_pref1,ax_pref2,ax_pref3,ax_prefβ,ax_prefΔT]
+        ylims!(ax,prefmin,prefmax)
+    end
+
+    for ax ∈ [ax_Tref1,ax_Tref2,ax_Tref3,ax_Trefβ,ax_TrefΔT,ax_Trefpref]
+        ylims!(ax,Trefmin,Trefmax)
+    end
+
+
+    for ax ∈ [ax_α1,ax_α2,ax_α3,ax_αβ,ax_αΔT,ax_αpref,ax_αTref]
+        ylims!(ax,αmin,αmax)
+    end
+
+
+
+    # do rad eq cloud 
+    
+    Π1_1σ,Π2_1σ,Π3_1σ,ΔTcloud_1σ,β_1σ,pref_1σ,Tref_1σ,α_1σ = get_variedparam2_obsfilt(sweepname_radbal,outdir_radbal,fday*(Tmin_max_obs + σTmin_max_obs),Tmax_min_obs - σTmax_min_obs)
+    Π1_2σ,Π2_2σ,Π3_2σ,ΔTcloud_2σ,β_2σ,pref_2σ,Tref_2σ,α_2σ  = get_variedparam2_obsfilt(sweepname_radbal,outdir_radbal,fday*(Tmin_max_obs + 2*σTmin_max_obs),Tmax_min_obs - 2*σTmax_min_obs)
+    Π1_3σ,Π2_3σ,Π3_3σ,ΔTcloud_3σ,β_3σ,pref_3σ,Tref_3σ,α_3σ  = get_variedparam2_obsfilt(sweepname_radbal,outdir_radbal,fday*(Tmin_max_obs + 3*σTmin_max_obs),Tmax_min_obs - 3*σTmax_min_obs)
+
+    logΠ1_obs = [log10.(Π1_1σ),log10.(Π1_2σ),log10.(Π1_3σ)]
+    logΠ2_obs = [log10.(Π2_1σ),log10.(Π2_2σ),log10.(Π2_3σ)]
+    logΠ3_obs = [log10.(Π3_1σ),log10.(Π3_2σ),log10.(Π3_3σ)]
+    logpref_obs = [log10.(pref_1σ),log10.(pref_2σ),log10.(pref_3σ)]
+    Tref_obs = [Tref_1σ./1e4,Tref_2σ./1e4,Tref_3σ./1e4]
+    α_obs = [α_1σ,α_2σ,α_3σ]
+
+    β_obs = if islogβ
+        [log10.(β_1σ),log10.(β_2σ),log10.(β_3σ)]
+    else
+        [β_1σ,β_2σ,β_3σ]
+    end
+    ΔTcloud_obs = [ΔTcloud_1σ,ΔTcloud_2σ,ΔTcloud_3σ]
+
+    ls = :solid
+
+    for i ∈ reverse(1:3)
+        plot2Dboundary_poly!(ax_21,logΠ1_obs[i],logΠ2_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_31,logΠ1_obs[i],logΠ3_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_32,logΠ2_obs[i],logΠ3_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_β1,logΠ1_obs[i],β_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_β2,logΠ2_obs[i],β_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_β3,logΠ3_obs[i],β_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_ΔT1,logΠ1_obs[i],ΔTcloud_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_ΔT2,logΠ2_obs[i],ΔTcloud_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_ΔT3,logΠ3_obs[i],ΔTcloud_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_ΔTβ,β_obs[i],ΔTcloud_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+
+        plot2Dboundary_poly!(ax_pref1,logΠ1_obs[i],logpref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_pref2,logΠ2_obs[i],logpref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_pref3,logΠ3_obs[i],logpref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_prefβ,β_obs[i],logpref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_prefΔT,ΔTcloud_obs[i],logpref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+
+        plot2Dboundary_poly!(ax_Tref1,logΠ1_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_Tref2,logΠ2_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_Tref3,logΠ3_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_Trefβ,β_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_TrefΔT,ΔTcloud_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_Trefpref,logpref_obs[i],Tref_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+
+        plot2Dboundary_poly!(ax_α1,logΠ1_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_α2,logΠ2_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_α3,logΠ3_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_αβ,β_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_αΔT,ΔTcloud_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_αpref,logpref_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+        plot2Dboundary_poly!(ax_αTref,Tref_obs[i],α_obs[i],ngrid,cobs[i],lw,ls;αpoly=αpoly,αline=αline)
+
+
+    end
+
+    # do no LW effect cloud 
+
+    Π1_3σ,Π2_3σ,Π3_3σ,ΔTcloud_3σ,β_3σ = get_variedparam_obsfilt(sweepname_nolw,outdir_nolw,fday*(Tmin_max_obs + 3*σTmin_max_obs),Tmax_min_obs - 3*σTmax_min_obs)
+
+    logΠ1_obs = log10.(Π1_3σ)
+    logΠ2_obs = log10.(Π2_3σ)
+    logΠ3_obs = log10.(Π3_3σ)
+    β_obs = if islogβ
+        log10.(β_3σ)
+    else
+        β_3σ
+    end
+
+
+    ls = :dash
+
+    plot2Dboundary!(ax_21,logΠ1_obs,logΠ2_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_31,logΠ1_obs,logΠ3_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_32,logΠ2_obs,logΠ3_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_β1,logΠ1_obs,β_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_β2,logΠ2_obs,β_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_β3,logΠ3_obs,β_obs,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_ΔT1,logΠ1_obs,ΔTcloud_3σ,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_ΔT2,logΠ2_obs,ΔTcloud_3σ,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_ΔT3,logΠ3_obs,ΔTcloud_3σ,ngrid,clw,lw_nolw,ls)
+    plot2Dboundary!(ax_ΔTβ,β_obs,ΔTcloud_3σ,ngrid,clw,lw_nolw,ls)
+
+
+
+
+    for ax ∈ [ax_Trefpref,ax_αpref]
+        vlines!(ax,prefdefault,color=cdef,linewidth=lw_def,linestyle=:dot)
+    end
+    vlines!(ax_αTref,Trefdefault,color=cdef,linewidth=lw_def,linestyle=:dot)
+
+    for ax ∈ [ax_pref1,ax_pref2,ax_pref3,ax_prefβ,ax_prefΔT]
+        hlines!(ax,prefdefault,color=cdef,linewidth=lw_def,linestyle=:dot)
+    end
+
+    for ax ∈ [ax_Tref1,ax_Tref2,ax_Tref3,ax_Trefβ,ax_TrefΔT,ax_Trefpref]
+        hlines!(ax,Trefdefault,color=cdef,linewidth=lw_def,linestyle=:dot)
+    end
+
+
+    for ax ∈ [ax_α1,ax_α2,ax_α3,ax_αβ,ax_αΔT,ax_αpref,ax_αTref]
+        hlines!(ax,αdefault,color=cdef,linewidth=lw_def,linestyle=:dot)
+    end
+
+
+    
+
+     # exclude last row 
+    for ax ∈ [ax_21,ax_31,ax_32,ax_β1,ax_β2,ax_β3,ax_ΔT1,ax_ΔT2,ax_ΔT3,ax_ΔTβ,
+        ax_pref1,ax_pref2,ax_pref3,ax_prefβ,ax_prefΔT,ax_Tref1, ax_Tref2,ax_Tref3,
+        ax_Trefβ,ax_TrefΔT,ax_Trefpref]
+        hidexdecorations!(ax,ticks=false,grid=false)
+    end
+
+    # exclude first column 
+    for ax ∈ [ax_32,ax_β2,ax_β3,ax_ΔT2,ax_ΔT3,ax_ΔTβ,ax_pref2,ax_pref3,ax_prefβ,ax_prefΔT,
+        ax_Tref2,ax_Tref3,ax_Trefβ,ax_TrefΔT,ax_Trefpref,ax_α2,ax_α3,ax_αβ,ax_αΔT,ax_αpref,ax_αTref]
+        hideydecorations!(ax,ticks=false,grid=false)
+    end
+
+    # rotate x ticks for last row 
+    for ax ∈ [ax_α1,ax_α2,ax_α3,ax_αβ,ax_αΔT,ax_αpref,ax_αTref]
+        ax.xticklabelrotation = xtickrotation
+    end
+
+    # add legend 
+    Legend(fig[1:2,5:7],[[PolyElement(color=cobs[i]) for i ∈ 1:3],[LineElement(color=:black,linestyle=:dash,linewidth=lw_nolw)]],
+    [[rich("1 ",rich("σ",font=:italic)),rich("2 ",rich("σ",font=:italic)),rich("3 ",rich("σ",font=:italic))],
+    [rich("3 ",rich("σ",font=:italic))]],["OBSERVATIONAL CONSISTENCY\nwith longwave cloud effects\n\nexpanded parameters","default parameters"],
+    tellheight=false,tellwidth=false,nbanks=3)
+
+    Legend(fig[3,5:7],[LineElement(color=cdef,linestyle=:dot,linewidth=lw_def)],[""],"default parameter values",
+    tellheight=false,tellwidth=false)
+
+    resize_to_layout!(fig)
+    save(figdir*"obsvΠs+Tcloudβ+pTrefα_3σ_radbal_nolw_poly_$(sweepname_nolw)_$(sweepname_radbal)$(plotname).pdf",fig)
+
+    nothing 
+    
+end
+
 function find2Dboundary(param1,param2;ngrid=50,isadjustmidend=true)
     """
     grid in one direction and get min and max values 
@@ -3488,10 +5211,11 @@ function find2Dboundary(param1,param2;ngrid=50,isadjustmidend=true)
     for i1 ∈ 1:ngrid 
         # find values within gridding of param 1 
         filt = (param1 .>= grid1[i1]) .&& (param1 .<= grid1[i1+1])
-        if sum(filt)>0 
-            param2_grid1 = param2[filt]
-            param2minmax[1,i1] = minimum(param2_grid1)
-            param2minmax[2,i1] = maximum(param2_grid1)
+        n1 = sum(filt)
+        if n1>=10 # add conservative smoothing 
+            param2_grid1 = sort(param2[filt])
+            param2minmax[1,i1] = param2_grid1[4] 
+            param2minmax[2,i1] = param2_grid1[end-3] 
         else
             param2minmax[:,i1] .= NaN 
         end 
@@ -3900,5 +5624,524 @@ end
 
 
 # FUNCTIONS TO PLOT SOLUTIONS #####################################
+
+# ODE VERSION OF MODEL ############################################
+function calcdTlogτLdt̂_ode!(dTlogτLdt̂,TlogτL,p,t̂)
+    """
+    calculate dTτLdt̂ in place for radiative balance model  
+    inputs:
+        * dTτLdt̂ [Array] - array with dTsurfdt̂, dτSWdt̂, dLdt̂ to be modified in place
+            + dTτLdt̂[1] = dTsurf/dt̂ [K / delay time]
+            + dTτLdt̂[2] = dτSW/dt̂ [1 / delay time]
+            + dTτLdt̂[3] = dL/dt̂ [J m⁻² / delay time]
+        * TτL [Array] - array with Tsurf(t̂), τSW(t̂), L(t̂)
+            + TτL[1] - Tsurf [K]
+            + TτL[2] - τSW [ ]
+            + TτL[3] - L [J m⁻²]
+        * t̂ [delay time] - time 
+        * p [Array] - array of parameters of DDE 
+            + Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint
+    output:
+        nothing 
+    """
+    
+    Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint = view(p,:) # unpack parameters
+    Tsurf, logτSW, L = TlogτL # unpack T(t̂), τ(t̂), L(t̂)
+    logτSW = max(logτSW,-100.)
+    τSW = exp(logτSW)
+
+    # reset when integrator tries crazy test values for Tsurf
+    Tsurf = max(Tsurf,ΔTcloud+1.)
+ 
+    εcloud = calcεcloud(τSW,β) # [ ] LW cloud emissivity 
+
+    dTlogτLdt̂[2] = Π₁*p_ref*exp(-T_ref/Tsurf)/τSW - Π₂ # dlogτSW/dt̂ [ ]
+
+    # solve for Tcloud_down 
+    Tcloud_down = calcTclouddown(ΔTcloud,Tsurf) # [K]
+
+    # note doLint set externally via callback 
+    # determines whether to integrate L or Tsurf 
+    # not a Boolean for performance purposes 
+    if doLint==1.
+        # when Tsurf==Tsolidus 
+        # if cooling, put cooling toward latent heat 
+        # if heating, put toward latent heat until L = 0
+        dTlogτLdt̂[1] = 0. # dTsurf/dt̂ [K s⁻¹]
+        dTlogτLdt̂[3] = -(f*S₀/(1. +α*τSW) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4) # dL/dt̂ [J m⁻² s⁻¹]
+    else
+        dTlogτLdt̂[1] = (f*S₀/(1. +α*τSW) + εcloud*σ*Tcloud_down^4 - σ*Tsurf^4)/Π₃ # dTsurf/dt̂ [K s⁻¹]
+        dTlogτLdt̂[3] = 0. # dL/dt̂ [J m⁻² s⁻¹]
+    end
+  
+    nothing
+end
+
+function solvedTlogτLdt̂_ode(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀,τ₀,Tsurfeq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+    """
+    integrate coupled equations for dT/dt̂, dτ/dt̂, & dL/dt̂ following the radiative balance model 
+    inputs:
+        * Π₁ [Pa⁻¹] - parameter 1
+        * Π₂ [ ] - parameter 2
+        * Π₃ [kg s⁻³ K⁻¹] - parameter 3
+        * p_ref [Pa] - reference pressure for Clausius-Clapeyron
+        * T_ref [K] - reference temperature for Clausius-Clapeyron
+        * α [ ] - albedo parameter 
+        * S₀ [W m⁻²] - incident stellar insolation 
+        * f [ ] - heat redistribution factor 
+        * β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+        * Tmagma_solidus [K] - solidus temperature of magma 
+        * ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+        * t̂end [ ] - maximum (model) time to integrate for 
+        * T₀ [K] - initial surface temperature 
+        * τ₀ [ ] - initial shortwave optical depth 
+        * Tsurfeq [K] - surface temperature fixed point 
+        * maxiters [int] - maximum iterations of the DDE solver 
+            + optional, default value: 1e7 
+        * alg [OrdinaryDiffEq integration algorithm]
+            note, see https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/ for options
+            + optional, default value: KenCarp4()
+        * * reltol [Float] - relative tolerance of the DDE solver 
+            + optional, default value: 1e-8
+        * abstol [Float] - absolute tolerance of the DDE solver 
+            + optional, default value: 1e-10
+    output:
+        * ODE solution [SciMLBase.ODESolution] - solution object 
+    """ 
+    # set up times to check for early stopping 
+    t̂checks = t̂check1:Δt̂:t̂end
+
+    # don't allow initial Tsurf condition below or at solidus
+    T₀ = max(T₀,Tmagma_solidus+1.)
+    # therefore, start with L integration off 
+    doLint = 0
+
+    # set initial condition 
+    TlogτL₀ = [T₀,log(τ₀),0.]
+
+
+    # set up ODE problem 
+    # see DifferentialEquations.jl documentation: 
+    # https://docs.sciml.ai/DiffEqDocs/stable/types/ode_types/ 
+    prob = ODEProblem(calcdTlogτLdt̂_ode!, TlogτL₀, (0.,t̂end), [Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,doLint];
+    isoutofdomain=isoutofdomain2)
+
+
+    # set up callbacks 
+    # see DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/features/callback_functions/
+
+    # check whether solution has stabilized to fix point or limit cycle 
+    checkisstop = (u,t,integrator) -> checkisstoplong(u,t,integrator,t̂checks,Tsurfeq,Δt̂,ΔTthres)
+    cb_stop = DiscreteCallback(checkisstop,terminate!) #save_positions=(true, false))
+    # check whether surface temperature hits magma ocean solidus temperature 
+    cb_magma_solidus = ContinuousCallback(checkTmagma_solidus,nothing,affectTmagma_solidus_radbal2!;abstol=abstol)
+    # check whether enough latent heat of melting has been supplied to resume surface temperature increasing 
+    # (when surface temperature at magma ocean solidus temperature)
+    cb_increaseTsurf = ContinuousCallback(checkL_increaseTsurf,nothing,affectL_increaseTsurf_radbal2!;abstol=abstol)
+    # group callbacks together 
+    cbset = CallbackSet(cb_stop,cb_increaseTsurf,cb_magma_solidus)
+
+    # integrate! 
+    # return solution 
+    # see DifferentialEquations.jl documentation:
+    # https://docs.sciml.ai/DiffEqDocs/stable/basics/solution/
+    solve(prob,alg;maxiters=maxiters,callback=cbset,abstol=abstol,reltol=reltol,tstops=t̂checks,dtmax=Δt̂/4) 
+end
+
+function calcsolprop_ode(p;maxiters=1e7,alg=Tsit5(),reltol=1e-8,
+    abstol=1e-10,fTsurf₀=0.99,fτSW₀=0.99,addTsurf₀=0.,addτSW₀=0.,t̂check1=300.,Δt̂=100.,t̂end=1e4,ΔTthres=1.,
+    Rstar=R55cncA,aplanet=a55cnce,Tstar=T55cncA,ratA=1.,isplot=false,figdir="",runname="")
+    """
+    calculate model solution properties for ODE version of radiative balance model 
+    inputs:
+        * p [Array, dim:11] - array of parameters for model 
+            + Π₁ [Pa⁻¹ s⁻¹] - bulk parameter 1 prime
+            + Π₂ [s⁻¹] - bulk parameter 2 prime 
+            + Π₃ [kg s⁻² K⁻¹] - bulk parameter 3 prime 
+            + T_ref [T] - reference temperature for Clausius-Clapeyron 
+            + p_ref [Pa] - reference pressure for Clausius-Clapeyron
+            + α [ ] - albedo parameter 
+            + S₀ [W m⁻²] - incident stellar insolation 
+            + f [ ] - heat redistribution factor 
+            + β [ ] - ratio of longwave cloud optical depth to shortwave cloud optical depth (i.e., τLW/τSW)
+            + ΔTcloud [K] - difference between cloud downward and upward emission temperature (ΔTcloud = Tcloud↓ - Tcloud↑)
+            + Tmagma_solidus [K] - solidus temperature of magma
+        * maxiters [Int] - maximum iterations of the DDE solver 
+            + optional, default value: 1e7 
+        * alg [OrdinaryDiffEq integration algorithm]
+            note, see https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/ for options
+            + optional, default value: KenCarp4()
+        * reltol [Float] - relative tolerance of the ODE solver 
+            + optional, default value: 1e-8
+        * abstol [Float] - absolute tolerance of the ODE solver 
+            + optional, default value: 1e-10
+        > note, Tsurf(t̂=0) = fTsurf₀ * Tsurfeq + addTsurf₀
+            * fTsurf₀ [ ] - multiplicative factor for Tsurf for initial condition 
+                + optional, default value: 0.99
+            * addTsurf₀ [K] - additive factor for Tsurf for initial condition 
+                + optional, default value: 0 K
+        > note, τSW(t̂=0) = fτSW₀ * τSWeq + addτSW₀
+            * fτSW₀ [ ] - multiplicative factor for shortwave optical depth for initial condition
+                + optional, default value: 0.99
+            * addτSW₀ [ ] - additive factor for shortwave optical depth for initial condition
+                + optional, default value: 0
+        * t̂check1 [delay time] - first time to check DDE ending conditions 
+            + optional, default value: 300 delay times
+        * Δt̂ [delay time] - time duration to use to check ending conditions, note Δt̂ ≤ t̂check1
+            + optional, default value: 100 delay times 
+        * t̂end [delay time] - end time for integration if DDE solution does not stabilize
+            note, important in chaos regimes of parameter space !
+            + optional, default value: 1e4 delay time 
+        * ΔTthres [K] - surface temperature buffer around fixed point for determining end state 
+            note, lower values will cause longer integration
+            do not set below about 10*reltol*Teq 
+            + optional, default value: 1 K 
+        * Rstar [m] - radius of star, used for SW brightness temperature diagnostic 
+            + optional, default value: R55cncA (radius of 55 Cnc A)
+        * aplanet [m] - planet semi-major axis, used for SW brightness temperature diagnostic
+            + optional, default value: a55cnce (semi-major axis of 55 Cnc e)
+        * Tstar [K] - effective temperature of star, used for SW brightness temperature diagnostic
+            + optional, default value: T55cncA (effective temperature of 55 Cnc A)
+        * ratA [ ] - ratio of geometric albedo to substellar point albedo 
+            + optional, default value: 1
+        * isplot [Bool] - whether to make plots associated with diagnosing solution end state
+            note, do not set to true for a large parameter sweep  
+            + optional, default value: false 
+        * figdir [String] - figure directory if isplot=true 
+            + optional, default value: ""
+        * runname [String] - name of run for saving figure if isplot=true 
+            + optional, default value: ""
+
+    outputs:
+        * endstateflag [Int] - integer flag associated with integration end state 
+        * P [delay time] - period of limit cycle if applicable (otherwise NaN)
+        * Tsurfmin [K] - minimum surface temperature in last Δt̂ of integration time 
+        * Tsurfmax [K] - maximum surface temperature in last Δt̂ of integration time 
+        * TbLWmin [K] - minimum LW brightness temperature (λ = 4.5 μm) in last Δt̂ of integration time 
+        * TbLWmax [K] - maximum LW brightness temperature (λ = 4.5 μm) in last Δt̂ of integration time 
+        * TbSWmin [K] - minimum SW brightness temperature (λ = 500 nm) in last Δt̂ of integration time
+        * TbSWmax [K] - maximum LW brightness temperature (λ = 500 nm) in last Δt̂ of integration time
+        * τSWmin [ ] - minimum SW cloud optical depth in last Δt̂ of integration time 
+        * τSWmax [ ] - maximum SW cloud optical depth in last Δt̂ of integration time
+        * Lmin [J m⁻²] - minimum magma ocean column accumulated latent heat of fusion in last Δt̂ of integration time
+        * Lmax [J m⁻²] - maximum magma ocean column accumulated latent heat of fusion in last Δt̂ of integration time
+    """
+    # throw error if Δt̂ > t̂check1
+    if Δt̂ > t̂check1
+        @show Δt̂ t̂check1
+        error("Δt̂ > t̂check1 not permitted! set Δt̂ ≤ t̂check1!")
+    end
+
+    # expand parameters 
+    Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus = p
+
+    Tsurfeq,τSWeq = findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud)
+
+    # don't integeate if Tsurfeq<Tmagma_solidus
+    if Tsurfeq<Tmagma_solidus
+        return -2,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+    end
+    
+    Tsurf₀ = Tsurfeq*fTsurf₀ + addTsurf₀
+    τSW₀ = max(τSWeq*fτSW₀ + addτSW₀,abstol)
+
+    sol = solvedTlogτLdt̂_ode(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,Tsurf₀,τSW₀,Tsurfeq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+
+    endstateflag = -1 
+    P = NaN 
+    Tsurfmin = NaN
+    Tsurfmax = NaN
+    TbLWmin = NaN
+    TbLWmax = NaN
+    TbSWmin = NaN
+    TbSWmax = NaN
+    τSWmin = NaN
+    τSWmax = NaN
+    Lmin = NaN
+    Lmax = NaN
+
+    # alert user if return code not successful 
+    if SciMLBase.successful_retcode(sol)
+        endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax = checkendsol_radbal2(sol,ΔTthres,Tsurfeq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA;isplot=isplot,figdir=figdir,runname=runname)
+    else
+        @info "unsuccessful integration!"
+        @show p sol.retcode
+    end
+
+    # adjust endstateflag if hit t̂end 
+    if sol.t[end] == t̂end
+        if endstateflag == 0
+            endstateflag = 4
+        elseif endstateflag == 1
+            endstateflag = 5
+        elseif endstateflag == 2
+            endstateflag = 6
+        elseif endstateflag == 3
+            endstateflag = 7
+        elseif endstateflag == 8
+            endstateflag = 9
+        end
+    end
+
+    endstateflag,P,Tsurfmin,Tsurfmax,TbLWmin,TbLWmax,TbSWmin,TbSWmax,τSWmin,τSWmax,Lmin,Lmax
+end
+
+function checksol_ode(p,figdir,runname;maxiters=1e7,alg=Tsit5(),reltol=1e-8,
+    abstol=1e-10,fT₀=0.99,fτ₀=0.99,addT₀=0.,addτ₀=0.,t̂check1=10000.,Δt̂=5000.,t̂end=1e5,ΔTthres=1.,
+    Tstar=T55cncA,aplanet=a55cnce,Rstar=R55cncA,ratA=1.,Δt̂plot=1000.,λ_LW=4.5,λ_SW=0.5e-6,λ_SWname="0.5",lw=2,fsteps=10,
+    isplottimesteps=false)
+    """
+    run radiative balance model, make plots, and return solution object 
+    """
+    Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus = p
+
+
+    Teq,τeq = findTτeqnum_radbal(Π₁,Π₂,T_ref,p_ref,α,S₀,f,β,ΔTcloud)
+
+    # handle Teq<Tmagma_solidus case
+    if Teq<Tmagma_solidus
+        @show Π₁,Π₂,Π₃,T_ref,p_ref,α,S₀,f,β,ΔTcloud,Tmagma_solidus
+        error("Teq<Tmagma_solidus")
+    end
+    
+
+    T₀ = Teq*fT₀ + addT₀
+    τ₀ = τeq*fτ₀ + addτ₀
+    τ₀ = max(τ₀,abstol)
+
+    sol = solvedTlogτLdt̂_ode(Π₁,Π₂,Π₃,p_ref,T_ref,α,S₀,f,β,Tmagma_solidus,ΔTcloud,t̂end,T₀,τ₀,Teq,maxiters,alg,reltol,abstol,ΔTthres,Δt̂,t̂check1)
+
+    # 
+    tchecks = t̂check1:Δt̂:t̂end
+    fig = Figure()
+    ax_max = Axis(fig[1,1],xlabel="block",ylabel="T max [K]")
+    ax_min = Axis(fig[2,1],xlabel="block",ylabel="T min [K]")
+    for (i,tcheck) ∈ enumerate(tchecks[2:end]) 
+        filt2 =  (sol.t .< (tcheck-Δt̂)) .&& (sol.t .>= (tcheck-2*Δt̂))
+        if sum(filt2)>5
+            Tmin_prev,Tmax_prev = extrema(sol[1,filt2])
+            scatter!(ax_max,[i],[Tmax_prev],color=:red)
+            errorbars!(ax_max,[i],[Tmax_prev],[ΔTthres],color=:red,linewidth=3)
+            scatter!(ax_min,[i],[Tmin_prev],color=:blue)
+            errorbars!(ax_min,[i],[Tmin_prev],[ΔTthres],color=:blue,linewidth=3)
+        end
+    end
+    save(figdir*"Textremaovertcheck_run$(runname).pdf",fig)
+
+    if SciMLBase.successful_retcode(sol) # avoid plotting maxiters errors 
+        endstateflag,P = checkendsol_radbal2(sol,ΔTthres,Teq,Δt̂,β,ΔTcloud,α,Rstar,aplanet,Tstar,ratA)[1:2]
+    
+        try 
+            filt = sol.t .>= max(0,sol.t[end]-Δt̂plot)
+
+            if sum(filt)<2
+                filt[:] .= true
+            end
+
+            tfilt = sol.t[filt]
+
+            tsteps = unique(tfilt)
+            nsteps = length(tsteps)
+            interp_linear = linear_interpolation(1:nsteps, tsteps)
+            ts_interp = interp_linear(LinRange(1,nsteps,nsteps*fsteps))
+
+
+            Tfilt = sol.(ts_interp,idxs=1)
+            logτSWfilt = sol.(ts_interp,idxs=2)
+            τSWfilt = exp.(logτSWfilt)
+            # don't fail plotting from negative / 0 values (only occurs for interpolation)
+            τSWfilt[τSWfilt.<abstol] .= NaN
+            τSWfilt_interp = deepcopy(τSWfilt)
+    
+            Lfilt = sol.(ts_interp,idxs=3)
+            Tcloudupfilt = calcTcloudup.(ΔTcloud,Tfilt)
+            Tbright_4p5 = calcTbrightλ_LW.(4.5e-6,Tfilt,τSWfilt,Tcloudupfilt,β)
+            Tbright_1 = calcTbrightλ_SW.(λ_SW,Tfilt,τSWfilt,α,Rstar,aplanet,Tstar,ratA)
+
+            logτSWfilt = sol[2,filt]
+            τSWfilt = exp.(logτSWfilt)
+            # don't fail plotting from negative / 0 values (only occurs for interpolation)
+            # (should not happen any more...)
+            τSWfilt[τSWfilt.<abstol] .= NaN
+
+            tfilt = ts_interp .- ts_interp[1]
+
+            # plot T bright LW and SW phase space 
+            fig = Figure() 
+            Tbrightlabel_1 = rich(rich("T",font=:italic),subscript("bright"),rich("(λ=$(λ_SWname)",font=:italic),"μm",rich(")",font=:italic)," [K]")
+            Tbrightlabel_4p5 = rich(rich("T",font=:italic),subscript("bright"),rich("(λ=4.5",font=:italic),"μm",rich(")",font=:italic)," [K]")
+            ax = Axis(fig[1,1],xlabel=Tbrightlabel_4p5,ylabel=Tbrightlabel_1)
+            lines!(ax,Tbright_4p5,Tbright_1,color=:black,linewidth=lw)
+            save(figdir*"Tbright1v4p5_run$(runname).pdf",fig)
+
+            # plot Tsurf vs τSW 
+            fig = Figure()
+            ax = Axis(fig[1,1],ylabel=rich(rich("T",font=:italic),subscript("surf")," [K]"),xlabel=rich(rich("τ",font=:italic),subscript("SW")," [ ]"),xscale=log10)
+            lines!(ax,τSWfilt_interp,Tfilt,linewidth=lw,color=:black)
+            hlines!(ax,Teq,linestyle=:dash,color=:red)
+            vlines!(ax,τeq,linestyle=:dash,color=:red)
+            save(figdir*"TsurfτSW_run$(runname).pdf",fig)
+
+            # plot Tsurf and τSW vs t 
+            fig = Figure() 
+            axT = Axis(fig[1,1],xlabel="time [s]",ylabel=rich(rich("T",font=:italic),subscript("surf")," [K]"))
+            if tfilt[1]!=tfilt[end]
+                xlims!(axT,tfilt[1],tfilt[end])
+                # axT.xticks = tfilt[1]:tfilt[end]
+            end
+            lines!(axT,tfilt,Tfilt,linewidth=lw,color=:black)
+            if isplottimesteps
+                scatter!(axT,sol.t[filt] .- sol.t[filt][1],sol[1,filt],color=:blue,marker=:xcross,markersize=5)
+            end
+            hlines!(axT,Teq,linestyle=:dash,color=:red)
+            hspan!(axT,Teq-ΔTthres,Teq+ΔTthres,color=(:red,0.25))
+            axτ = Axis(fig[2,1],xlabel="time [s]",ylabel=rich(rich("τ",font=:italic),subscript("SW")," [ ]"),yscale=log10)
+            if tfilt[1]!=tfilt[end]
+                xlims!(axτ,tfilt[1],tfilt[end])
+                # axτ.xticks = tfilt[1]:tfilt[end]
+            end
+            lines!(axτ,sol.t[filt] .- sol.t[filt][1],τSWfilt,linewidth=lw,color=:black)
+            hlines!(axτ,τeq,linestyle=:dash,color=:red)
+            save(figdir*"TsurfτSWvt_run$(runname).pdf",fig)
+
+            
+
+            # plot L with coloring for Tsurf  
+            filt_Tsolidus = abs.(Tfilt .- Tmagma_solidus) .< 10*reltol
+            filt_Tsolidus_1K = (.!filt_Tsolidus) .&& (abs.(Tfilt .- Tmagma_solidus) .< 1.)
+            filt_gtTsolidus = Tfilt .> (Tmagma_solidus+1)
+            filt_ltTsolidus = Tfilt .< (Tmagma_solidus .-1)
+            ms = 5
+            if sum(filt_Tsolidus)>0
+                fig = Figure()
+                ax = Axis(fig[1,1],xlabel="time [s]",ylabel=rich(rich("L",font=:italic)," [J m⁻²]"))
+                if tfilt[1]!=tfilt[end]
+                    xlims!(ax,tfilt[1],tfilt[end])
+                    ax.xticks = tfilt[1]:tfilt[end]
+                end
+                lines!(ax,tfilt,Lfilt,color=:black,linewidth=2)
+                scatter!(ax,tfilt[filt_Tsolidus],Lfilt[filt_Tsolidus],color=:red,markersize=ms,
+                label=rich(rich("T",font=:italic),subscript("surf")," = ",rich("T",font=:italic),subscript("solidus")))
+                if sum(filt_Tsolidus_1K)>0
+                    scatter!(ax,tfilt[filt_Tsolidus_1K],Lfilt[filt_Tsolidus_1K],color=:coral1,markersize=ms,
+                    label=rich(rich("T",font=:italic),subscript("surf")," ≈ ",rich("T",font=:italic),subscript("solidus")))
+                end
+                if sum(filt_gtTsolidus)>0
+                    scatter!(ax,tfilt[filt_gtTsolidus],Lfilt[filt_gtTsolidus],color=:blue,markersize=ms,marker=:xcross,
+                    label=rich(rich("T",font=:italic),subscript("surf")," > ",rich("T",font=:italic),subscript("solidus")))
+                end
+                if sum(filt_ltTsolidus)>0
+                    scatter!(ax,tfilt[filt_gtTsolidus],Lfilt[filt_gtTsolidus],color=:deepskyblue3,markersize=ms,marker=:xcross,
+                    label=rich(rich("T",font=:italic),subscript("surf")," < ",rich("T",font=:italic),subscript("solidus")))
+                end
+                axislegend()
+                save(figdir*"Lvt_Tsoldiushighlight_run$(runname).pdf",fig)
+            end
+
+        catch e 
+            println("error in plotting: $e")
+        end
+    else
+        @info "unsuccessful integration!"
+        @show p sol.retcode
+    end
+    
+
+    sol 
+end
+
+function check_param_sweep_ode(sweepname,outdir;isplot=true,maxfig=50,maxparamprint=5,figdirbase="sfigs/",
+    fday=1.1,Tmin_max_obs=873.,σTmin_max_obs=167.,Tmax_min_obs=2816.,σTmax_min_obs=368.,
+    nσ_plot=3,alg=Tsit5(),reltol=1e-8,abstol=1e-10,t̂end=1e4)
+    """
+    check results of parameter sweep 
+        + print end state flags 
+        + print tests checking model behavior 
+            > bad end state flags 
+            > Tsurf / L integration switch misbehaviors when Tsurf = Tsolidus
+        + make plots for problematic runs (up to maxfig)
+        + print parameter ranges consistent with observations 
+        + print solution properties for solutions consistent with observations
+    """
+    fnc = outdir*sweepname*".nc"
+    Tsurf_min = ncread(fnc,"T_surf_min")
+    T_solidus = ncread(fnc,"T_solidus")
+    Lmin = ncread(fnc,"L_min")
+    Lmax = ncread(fnc,"L_max")
+    endstateflag = ncread(fnc,"end_state_flag")
+
+    # get model type 
+    model_type = ncgetatt(fnc,"Global","model_type")
+    
+
+    nsamp = length(T_solidus)
+
+    # check model runs via end state flags 
+    uni_flags = unique(endstateflag)
+    println("end state flags encountered: $(uni_flags)")
+
+    println("$(sum(endstateflag.==1))/$(nsamp) runs reach steady state")
+    println("$(sum(endstateflag.==2))/$(nsamp) runs reach limit cycles")
+    println("$(sum(endstateflag.==8))/$(nsamp) runs reach complex limit cycles")
+    println("$(sum(endstateflag.==-1))/$(nsamp) runs fail to integrate")
+    println("$(sum(endstateflag.==-2))/$(nsamp) runs have equilibrium Tsurf < Tsolidus")
+    println("$(sum(endstateflag.==0))/$(nsamp) runs can't be classified")
+    println("$(sum(endstateflag.==3))/$(nsamp) runs have erratic periods but are ending early")
+    println("$(sum(endstateflag.==4))/$(nsamp) runs can't be classified and reach t̂end")
+    println("$(sum(endstateflag.==5))/$(nsamp) runs reach steady state but at t̂end")
+    println("$(sum(endstateflag.==6))/$(nsamp) runs reach limit cycles but at t̂end")
+    println("$(sum(endstateflag.==9))/$(nsamp) runs reach complex limit cycles but at t̂end")
+    println("$(sum(endstateflag.==7))/$(nsamp) runs have erratic periods and reach t̂end (possible chaotic regime)\n")
+
+    if isplot
+        # make fig directory 
+        figdir = figdirbase*sweepname*"/"
+        mkpath(figdir)
+        ps = get_parameters(sweepname,outdir)
+        # plot problems (note 5-8 are not problems per se but want to see cases)
+        flag_probs = [-1,0,2,3,4,5,6,7,8]
+        for flag_prob ∈ flag_probs
+            if flag_prob ∈ uni_flags
+                p_flag = ps[endstateflag.==flag_prob,:]
+                n_flag = size(p_flag)[1]
+                println("plotting flag $flag_prob")
+                for irun ∈ 1:(min(n_flag,maxfig))
+                    runname = "$(round(Int(flag_prob)))_$(irun)"
+                    if irun < maxparamprint
+                        @show p_flag[irun,:]
+                    end
+                    if flag_prob ∉ [-1,7]
+                        calcsolprop_ode(p_flag[irun,:];isplot=true,figdir=figdir,runname=runname,reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                        checksol_ode(p_flag[irun,:],figdir,runname;reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+                    end
+                end
+                println("\n")
+            end
+        end
+        # plot limit cycles 
+        iobs = find_obsfilt(sweepname,outdir,fday*(Tmin_max_obs + nσ_plot*σTmin_max_obs),Tmax_min_obs - nσ_plot*σTmax_min_obs)
+        p_lc_obs = ps[iobs,:]
+        n_lc_obs = size(p_lc_obs)[1]
+        println("plotting limit cycles")
+        for irun ∈ 1:(min(n_lc_obs,maxfig))
+            checksol_ode(p_lc_obs[irun,:],figdir,"lc_$(irun)";reltol=reltol,abstol=abstol,t̂end=t̂end,alg=alg)
+        end
+        println("\n")
+    end
+
+
+    # print parameter ranges consistent with obs
+    print_variedparam_ranges_obsfilt(sweepname,outdir)
+
+    println("\n")
+
+    # print property ranges consistent with obs 
+    print_property_ranges_obsfilt(sweepname,outdir)
+
+    nothing
+
+end
+# ODE VERSION OF MODEL ############################################
 
 end # end module 

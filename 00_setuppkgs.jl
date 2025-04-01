@@ -3,6 +3,6 @@ Pkg.activate(".")
 Pkg.instantiate()
 
 """
-this script sets up the project package enivornment
+this script sets up the project package environment
 (it may take a few minutes to run)
 """

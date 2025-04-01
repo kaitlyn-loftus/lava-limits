@@ -45,21 +45,21 @@ if isfile(fname)
 end
 
 # set figdirbase 
-figdirbase = "sfigs/"
+figdirbase = "ssfigs/"
 
 # set numerical tolerances for integration 
 reltol = 1e-8 
 abstol = 1e-10
 
 # set how long to integrate  
-t̂end = 1e7
+t̂end = 5e3
 
 # write notes for netcdf 
 notes4nc = "reltol = $(reltol), abstol = $(abstol), tend = $(t̂end) delay times"
 
 # number of cpus to parallelize over 
 # if running on a personal computer you may need to decrease ncpus
-ncpus = 30
+ncpus = 15
 
 # set up workers for distributed sweep 
 
@@ -105,7 +105,7 @@ try
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
     end
 
     # run model over all parameter combinations with progress bar 
@@ -119,7 +119,7 @@ try
     rmprocs(worker_procs;waitfor=30)
 
     # perform checks
-    check_param_sweep(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
+    check_param_sweep2(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
 catch e 
     # shut down processes before throwing error 
     println("removing all worker processes!")

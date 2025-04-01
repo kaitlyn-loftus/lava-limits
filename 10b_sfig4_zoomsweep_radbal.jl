@@ -10,13 +10,14 @@ using ProgressMeter
 using Random
 using LHS 
 using JLD2
+
 """
 this script runs a parallelized parameter sweep of the radiative balance cloud temperature model 
-for the full parameter space
+for a zoomed in parameter space consistent with observations 
 """
 
 # set number of parameter combinations 
-nsamp = Int(1e4)
+nsamp = Int(5e6)
 
 # set parameter ranges for sweep 
 # exact values randomly selected via Latin hypercube 
@@ -25,21 +26,27 @@ nsamp = Int(1e4)
 log_min_Π1_search = log_min_Π1
 log_max_Π1_search = log_max_Π1
 
-log_min_Π2_search = log_min_Π2
+log_min_Π2_search = max(log_min_Π2,-1.)
 log_max_Π2_search = log_max_Π2
 
 log_min_Π3_search = log_min_Π3
-log_max_Π3_search = log_max_Π3
+log_max_Π3_search = min(log_max_Π3,4.)
 
 log_min_β_search = -3
-log_max_β_search = 0.
+log_max_β_search = log10(4.)
 min_ΔTcloud_search = 0.
 max_ΔTcloud_search = 350.
+T_ref_min = 50e3 # [K]
+T_ref_max = 80e3 # [K] 
+log_p_ref_min = 10. # [log(Pa)]
+log_p_ref_max = 14. # [log(Pa)]
+α_min = 0.2
+α_max = 1.
 
 # directory to save outputs in 
-outdir="out/"
+outdir="out/SI/"
 # name of parameter sweep 
-sweepname = "fig3_fullsweep_radbal_logbeta"
+sweepname = "sfig2_zoomsweep_radbal_logbeta"
 # note output file saved as outdir*sweepname*".nc"
 # crash program if output file already exists (otherwise netcdf writing will crash at end)
 fname = outdir*sweepname*".nc"
@@ -54,16 +61,19 @@ figdirbase = "ssfigs/"
 # set numerical tolerances for integration 
 reltol = 1e-8 
 abstol = 1e-10 
+t̂check1 = 300.
+Δt̂ = 100.
+maxiters = 2e7
 
 # set how long to integrate  
-t̂end = 1e7
+t̂end = 3e3
 
 # write notes for netcdf 
 notes4nc = "reltol = $(reltol), abstol = $(abstol), tend = $(t̂end) delay times"
 
 # number of cpus to parallelize over 
-# if running on a personal computer you may need to decrease ncpus
-ncpus = 6
+# if running on a personal computer you will need to decrease ncpus
+ncpus = 50
 
 # set up workers for distributed sweep 
 
@@ -100,15 +110,19 @@ try
     end
 
     # set up parameters 
-    ps = setupparams4sweep_βlog(nsamp,log_min_Π1_search,log_max_Π1_search,log_min_Π2_search,log_max_Π2_search,
-        log_min_Π3_search,log_max_Π3_search,log_min_β_search,log_max_β_search,min_ΔTcloud_search,max_ΔTcloud_search)
+    ps = setupparams4sweep_βlog_refα(nsamp,log_min_Π1_search,log_max_Π1_search,log_min_Π2_search,log_max_Π2_search,
+    log_min_Π3_search,log_max_Π3_search,log_min_β_search,log_max_β_search,min_ΔTcloud_search,max_ΔTcloud_search,
+    T_ref_min,T_ref_max,log_p_ref_min,log_p_ref_max,α_min,α_max)
 
     # share pmaped function across workers 
     @everywhere begin 
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        t̂check1=$t̂check1
+        Δt̂=$Δt̂
+	    maxiters=$maxiters
+        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end,Δt̂=Δt̂,maxiters=maxiters)
     end
 
     # run model over all parameter combinations with progress bar 

@@ -20,7 +20,7 @@ runname = "fig2"
 # set model  parameters 
 Π1 = 9.47 # [Pa⁻¹]
 Π2 = 74.2 # [ ]
-Π3 = 115. # [ ]
+Π3 = 115. # [kg s⁻³ K⁻¹]
 T_ref = T_ref_SiO_0vap # [K]
 p_ref = p_ref_SiO_0vap # [Pa]
 α = 0.5 # [ ]
@@ -33,5 +33,4 @@ Tsolidus = 1400.0 # [K]
 # combine model parameters into input expected by model
 p_fig2 = [Π1, Π2, Π3, T_ref, p_ref, α, S₀, f, β, ΔTcloud, Tsolidus]
 
-# run radiative balance model 
-outputrun_radbal(p_fig2,outdir,runname;reltol=1e-10,abstol=1e-12)
+outputrun_radbal2(p_fig2,outdir,runname;reltol=1e-8,abstol=1e-10,fsteps=30)

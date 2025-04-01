@@ -17,7 +17,7 @@ for the full parameter space
 """
 
 # set number of parameter combinations 
-nsamp = Int(1e5)
+nsamp = Int(1e4)
 
 # set parameter ranges for sweep 
 # exact values randomly selected via Latin hypercube 
@@ -45,7 +45,7 @@ if isfile(fname)
 end
 
 # set figdirbase 
-figdirbase = "sfigs/"
+figdirbase = "ssfigs/"
 
 # set numerical tolerances for integration 
 reltol = 1e-8 
@@ -105,7 +105,7 @@ try
         reltol=$reltol
         abstol=$abstol
         t̂end=$t̂end
-        calcsolprop_pmap(i) = calcsolprop_radbal($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
+        calcsolprop_pmap(i) = calcsolprop_radbal2($ps[:,i];reltol=reltol,abstol=abstol,t̂end=t̂end)
     end
 
     # run model over all parameter combinations with progress bar 
@@ -119,7 +119,7 @@ try
     rmprocs(worker_procs;waitfor=30)
 
     # perform checks
-    check_param_sweep(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
+    check_param_sweep2(sweepname,outdir;figdirbase=figdirbase,reltol=reltol,abstol=abstol,t̂end=t̂end)
 catch e 
     # shut down processes before throwing error 
     println("removing all worker processes!")
